@@ -28,7 +28,7 @@ class XmlTagFixerPlugin(BasePlugin):
         self.fix_at_tag_format = cfg.get("fix_at_tag_format", True)
         self.convert_text_at_to_tag = cfg.get("convert_text_at_to_tag", False)
         # 提取 text 内嵌套的 at 标签为 msg 直接子元素（模型常把 at 写进 text 里导致失效）
-        self.extract_at_from_text = cfg.get("extract_at_from_text", False)
+        self.extract_at_from_text = cfg.get("extract_at_from_text", True)
         self.escape_special_chars = cfg.get("escape_special_chars", True)
         self.escape_code_fences = cfg.get("escape_code_fences", True)
         self.fallback_wrap_text = cfg.get("fallback_wrap_text", True)
