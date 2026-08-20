@@ -27,6 +27,8 @@ class XmlTagFixerPlugin(BasePlugin):
         self.fix_double_brackets = cfg.get("fix_double_brackets", True)
         self.fix_at_tag_format = cfg.get("fix_at_tag_format", True)
         self.convert_text_at_to_tag = cfg.get("convert_text_at_to_tag", False)
+        # 提取 text 内嵌套的 at 标签为 msg 直接子元素（模型常把 at 写进 text 里导致失效）
+        self.extract_at_from_text = cfg.get("extract_at_from_text", True)
         self.escape_special_chars = cfg.get("escape_special_chars", True)
         self.escape_code_fences = cfg.get("escape_code_fences", True)
         self.fallback_wrap_text = cfg.get("fallback_wrap_text", True)
@@ -338,6 +340,48 @@ class XmlTagFixerPlugin(BasePlugin):
 
         return modified
 
+    def _extract_at_from_text(self, root: ET.Element) -> bool:
+        """把 text 内嵌套的 <at> 提升为 msg 直接子元素。
+
+        模型经常把 at 写进 text 内部（如 <text>那这样 <at>123</at> 能收到不</text>），
+        而框架只认 msg 直接子元素的 at，导致 at 失效、消息里出现不了真@。
+        这里把 text 按 at 拆分：at 提升为 msg 直接子元素，其余文字按原顺序
+        拆成多个 text 包回原位置，顺序不变。
+        仅处理 text 直接子级的 at；更深层嵌套（如 text > foo > at）不动。
+        """
+        modified = False
+        for child in list(root):
+            if child.tag != "text" or not len(child):
+                continue
+            if not any(sub.tag == "at" for sub in child):
+                continue
+            new_nodes = []
+            text_buf = child.text or ""
+            at_count = 0
+            for sub in list(child):
+                if sub.tag == "at":
+                    at_count += 1
+                if text_buf.strip():
+                    te = ET.Element("text")
+                    te.text = text_buf
+                    new_nodes.append(te)
+                tail = sub.tail or ""
+                sub.tail = None  # 清掉 tail，避免序列化时重复
+                new_nodes.append(sub)
+                text_buf = tail
+            if text_buf.strip():
+                te = ET.Element("text")
+                te.text = text_buf
+                new_nodes.append(te)
+            if not new_nodes or not at_count:
+                continue
+            idx = list(root).index(child)
+            root.remove(child)
+            for j, node in enumerate(new_nodes):
+                root.insert(idx + j, node)
+            modified = True
+        return modified
+
     def _convert_text_at_in_element(self, elem: ET.Element, parent: ET.Element = None) -> None:
         """
         递归处理元素及其子元素，将 text 节点中的 @纯数字 替换为 at 标签。
@@ -613,6 +657,8 @@ class XmlTagFixerPlugin(BasePlugin):
                 root = ET.fromstring(msg_str)
                 if root.tag == "msg":
                     self._fix_at_tags(root)
+                    if self.extract_at_from_text:
+                        self._extract_at_from_text(root)
                     self._flatten_no_wrap(root)
                     self._wrap_text_in_element(root)
                     self._convert_text_at_in_element(root, None)
