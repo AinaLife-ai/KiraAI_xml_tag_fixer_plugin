@@ -53,6 +53,12 @@
     "default": true,
     "hint": "将 <at user_id=\"123\" /> 修复为 <at>123</at>，并处理尾随文本"
   },
+  "extract_at_from_text": {
+    "name": "提取 text 内嵌套的 At 标签",
+    "type": "switch",
+    "default": false,
+    "hint": "模型经常把 at 写进 text 内部（如 <text>那这样 <at>123</at> 能收到不</text>），而框架只认 msg 直接子元素的 at，导致真@失效。开启后自动把 text 内嵌套的 at 提升为 msg 直接子元素，其余文字按原顺序拆成多个 text，顺序不变；仅处理 text 直接子级的 at，更深层嵌套不动"
+  },
   "wrap_mode": {
     "name": "text 包裹模式",
     "type": "enum",
