@@ -1,4 +1,4 @@
-# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.3.0
+# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.4.0
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_xml_tag_fixer_plugin)
 
@@ -46,6 +46,7 @@
 | 终极兜底为纯文本 | 开 | 修复全失败时兜底发出，保证不丢消息 |
 | 兜底时剥离结构性标签 | 开 | 开：只留干净文本；关：整段转义逐字保真（payload 场景建议关） |
 | 修复 At 标签格式 | 开 | `<at user_id="123"/>` → `<at>123</at>` |
+| 提取 text 内嵌套的 At 标签 | 关 | 模型常把 at 写进 text 内部（如 `<text>那这样 <at>123</at> 能收到不</text>`），框架只认 msg 直接子元素的 at 导致失效；开启后自动提升为 msg 直接子元素，文字按原顺序拆成多个 text，顺序不变 |
 | 不包裹标签名单 | `["mimo_tts"]` | 名单内标签不包 `<text>`，可自行追加 |
 | 摊平不包裹标签内的嵌套 | 开 | 剥掉名单内标签被错误嵌套的子标签 |
 | 语音消息拆分发送 | 开 | 语音单条发，@/回复归文字消息 |
@@ -76,6 +77,10 @@
 
 <details>
 <summary><b>更新日志（点击展开）</b></summary>
+
+### 1.4.0 新增
+
+- **提取 text 内嵌套的 At 标签**（`extract_at_from_text`，默认关）：模型经常把 `<at>` 写进 `<text>` 内部（如 `<text>那这样 <at>123</at> 能收到不</text>`），而框架解析只认 msg 直接子元素的 at，导致真@失效、消息里只剩 @数字 文本。开启后自动把 text 内嵌套的 at 提升为 msg 直接子元素，其余文字按原顺序拆成多个 text 包回原位置，顺序不变；仅处理 text 直接子级的 at，更深层嵌套（如 text > foo > at）不动
 
 ### 1.3.0 新增
 
