@@ -1,3 +1,4 @@
+import json
 import re
 import xml.etree.ElementTree as ET
 from typing import Optional
@@ -9,8 +10,138 @@ from core.chat import MessageChain
 from core.chat.message_elements import At, Record, Reply
 from core.chat.message_utils import KiraMessageBatchEvent
 
+# 本插件的 plugin_id（= manifest.json 的 plugin_id = 配置文件名）
+PLUGIN_ID = "xml_tag_fixer"
+
 # MiMo TTS 插件的 plugin_id（用于接管其格式修复功能）
 MIMO_PLUGIN_ID = "kira-ai-plugin-mimo-tts"
+
+# 切块器用的 <msg> 扫描正则（模块级，避免每次调用重复编译）
+# 属性部分懒惰匹配，且不吞掉自闭合的 /（对齐原实现的开口识别口径）
+_MSG_OPEN_SEARCH_RE = re.compile(r"<msg(?:\s[^>]*?)?(/?)>")
+_MSG_ANY_SEARCH_RE = re.compile(r"<msg(?:\s[^>]*?)?(/?)>|</msg\s*>")
+
+# 标签定界符修复：`<<msg`（首尖括号打重）与 `<\/msg>`（反斜杠转义）
+_DBL_ANGLE_RE = re.compile(r"<<(\w+)")
+_BACKSLASH_TAG_RE = re.compile(r"<\\(/?)([a-zA-Z][\w-]*)>")
+
+# ========== 一次性配置迁移 ==========
+#
+# 1.5.0 把「处理 msg 外杂散内容」(strip_reasoning_block) 的默认值由 true 改为
+# false：总开关打开时，模型写在 <msg> 外的**规划/心声**会被当成消息发出去。
+# 对"把规划写到输出里"的模型，这是很尴尬的泄漏。
+#
+# 但只改 schema 默认值会产生歧义：框架 _ensure_plugin_config 只要发现配置
+# 文件里缺少某个键，就会写入该键的默认值 —— 于是"从没配过"和"主动配成 false"
+# 在文件里长得一模一样，无法区分该不该迁移。
+#
+# 所以这里用一个显式标记键来保证"只迁移一次"：
+#   - 没有标记 + 没有显式配置 → 迁移为 false，并打标记
+#   - 没有标记 + 已显式配置  → 尊重用户选择，只打标记
+#   - 已有标记               → 什么都不做（用户之后怎么改都不再干预）
+_MIGRATION_KEY = "_migrated_strip_reasoning_default"
+_MIGRATION_VERSION = "1.5.0"
+_STRIP_KEY = "strip_reasoning_block"
+
+
+def _atomic_write_json(path, data) -> bool:
+    """原子写 JSON：临时文件 + fsync + os.replace。
+
+    框架自身的 save_config 是 `open(w)` 直写，写一半崩溃会丢整个配置。
+    插件绝不走那条路 —— 迁移必须保证"要么完整写成，要么原文件不动"。
+    """
+    import os
+    import tempfile
+    d = os.path.dirname(str(path))
+    try:
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".xmlfix_", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, str(path))
+            return True
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            raise
+    except Exception as e:
+        logger.error(f"[xml_tag_fixer] 原子写配置失败，保持原文件不动: {e}")
+        return False
+
+
+def _read_json(path) -> Optional[dict]:
+    """读 JSON。任何异常都返回 None（调用方据此中止迁移，绝不覆盖）。"""
+    import os
+    if not os.path.isfile(str(path)):
+        return None
+    try:
+        with open(str(path), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception as e:
+        logger.error(f"[xml_tag_fixer] 读取配置失败，跳过迁移: {e}")
+        return None
+
+
+def migrate_config_once(config_path) -> Optional[str]:
+    """把「处理 msg 外杂散内容」的默认值一次性迁移为 false。
+
+    返回描述迁移结果的字符串（供日志），无需迁移时返回 None。
+
+    安全约定（宁可不动，也不丢配置）：
+      1. 读不到 / 解析不了现有配置 → 直接中止，不写任何东西
+      2. 只增改 _STRIP_KEY 与 _MIGRATION_KEY 两个键，其余键原样保留
+      3. 原子写（临时文件 + fsync + os.replace）
+      4. 写回后重新解析校验，确认配置仍完整可读
+      5. 任何一步失败 → 放弃迁移，保持原文件不变
+    """
+    import os
+
+    cfg = _read_json(config_path)
+    if cfg is None:
+        # 文件不存在 = 全新安装，schema 默认值即 false，无需迁移
+        if not os.path.isfile(str(config_path)):
+            return None
+        return None   # 存在但读不了 → 中止（绝不覆盖）
+
+    if _MIGRATION_KEY in cfg:
+        return None   # 已迁移过，用户之后怎么改都不再干预
+
+    before = dict(cfg)
+    if _STRIP_KEY not in cfg:
+        # 用户从未显式配置过 → 采用新默认（关）
+        cfg[_STRIP_KEY] = False
+        action = "默认值迁移为 false（关闭 msg 外杂散内容）"
+    else:
+        # 用户已显式配置过 → 尊重原值，只打标记
+        action = f"已显式配置为 {cfg[_STRIP_KEY]!r}，保留用户选择"
+
+    cfg[_MIGRATION_KEY] = _MIGRATION_VERSION
+
+    # 二次确认：除这两个键外不得有任何改动
+    for k, v in before.items():
+        if k in (_STRIP_KEY,):
+            continue
+        if cfg.get(k) != v:
+            logger.error("[xml_tag_fixer] 迁移会改动其它键，已放弃")
+            return None
+
+    if not _atomic_write_json(config_path, cfg):
+        return None
+
+    # 写回后校验：配置必须仍然完整可读，且键数不少于迁移前
+    check = _read_json(config_path)
+    if check is None or len(check) < len(before):
+        logger.error("[xml_tag_fixer] 迁移后校验失败（配置可能损坏），请手动检查")
+        return None
+
+    logger.info(f"[xml_tag_fixer] 配置迁移 1.5.0：{action}")
+    return action
 
 
 class XmlTagFixerPlugin(BasePlugin):
@@ -25,6 +156,8 @@ class XmlTagFixerPlugin(BasePlugin):
             self.wrap_mode = "blacklist"
         self.fix_missing_msg = cfg.get("fix_missing_msg", True)
         self.fix_double_brackets = cfg.get("fix_double_brackets", True)
+        # 还原 `<\/msg>` 这类反斜杠转义的标签定界符（模型从 JSON/正则习惯串味）
+        self.fix_backslash_tags = cfg.get("fix_backslash_tags", True)
         self.fix_at_tag_format = cfg.get("fix_at_tag_format", True)
         self.convert_text_at_to_tag = cfg.get("convert_text_at_to_tag", False)
         # 提取 text 内嵌套的 at 标签为 msg 直接子元素（模型常把 at 写进 text 里导致失效）
@@ -38,7 +171,9 @@ class XmlTagFixerPlugin(BasePlugin):
         self.split_blank_line_messages = cfg.get("split_blank_line_messages", False)
         self.merge_marker_span_msgs = cfg.get("merge_marker_span_msgs", True)
         # 「处理 msg 外杂散内容」总开关（键名保留 strip_reasoning_block 兼容旧配置）
-        self.handle_stray_content = cfg.get("strip_reasoning_block", True)
+        # 1.5.0 起默认关闭：打开时模型写在 <msg> 外的**规划/心声**会被当成消息发出。
+        # 关掉后仍会补包「忘带 msg 的功能标签」（语音/图片/@/表情），不影响修复能力。
+        self.handle_stray_content = cfg.get("strip_reasoning_block", False)
         # @on.llm_request 缓存的已注册标签名（区分 msg 级 / root 级），
         # 用于杂散内容按身份分流：已注册标签内容绝不转义，未注册标签内部整体转义。
         # 初始值填入框架内置标签：即使缓存尚未刷新（异常/首次），内置功能标签也受保护
@@ -47,10 +182,10 @@ class XmlTagFixerPlugin(BasePlugin):
             "record", "file", "video", "poke", "json",
         }
         self._registered_root_tags: set = set()
-        # 排除的邮箱域名后缀（额外保护）
-        self.text_at_exclude_domains = cfg.get("text_at_exclude_domains", [
+        # 排除的邮箱域名后缀（额外保护）；显式配成 null 时回退默认，避免迭代 None 崩
+        self.text_at_exclude_domains = cfg.get("text_at_exclude_domains") or [
             "com", "cn", "net", "org", "edu", "gov", "io", "co", "uk", "jp", "de", "fr", "ru"
-        ])
+        ]
         # 框架内置媒体/控制标签：内容不是普通文本，完全不递归、不包裹
         self.IGNORE_TAGS = {
             "file", "record", "video", "image", "sticker", "forward", "reply", "reasoning",
@@ -81,6 +216,80 @@ class XmlTagFixerPlugin(BasePlugin):
 
         self._mimo_checked = False
 
+    # ========== 标签定界符修复（双尖括号 / 反斜杠转义）==========
+
+    def _known_tag_names(self) -> set:
+        """当前环境里"确实算标签"的名字集合。"""
+        return (
+            self.IGNORE_TAGS
+            | self._registered_msg_tags
+            | self._registered_root_tags
+            | self.no_wrap_tags
+            | self.force_wrap_tags
+            | {"msg", "text"}
+        )
+
+    def _is_tag_like(self, name: str, xml_str: str) -> bool:
+        """判断某个名字"确实像标签"，用于给 `<<name` / `<\\name>` 的还原把关。
+
+        判据（任一成立即可）：
+        1. 在已知标签名单里（框架内置 / 本次请求已注册 / 用户配置的豁免名单）；
+        2. 文本别处存在**同名的闭合标签** `</name>` ——
+           模型写错开口却写对闭合是最常见形态（`<<msg>...</msg>`）。
+
+        ⚠ 不能用"别处存在 `<name`"当判据：`a<<b` 里那个被折叠出来的
+        `<b` 自身就会让判据自匹配，等于没判据。闭合标签的形态唯一，
+        不会被开口修复操作本身制造出来。
+        """
+        return name in self._known_tag_names() or f"</{name}>" in xml_str
+
+    def _apply_backslash_tags(self, xml_str: str) -> str:
+        r"""把 `<\/msg>` / `<\\msg>` 这类"反斜杠转义定界符"还原成真标签。
+
+        模型从 JSON/正则习惯串味过来时，会把闭合标签写成 `<\/msg>`。
+        旧版对此毫无处理 —— 它被 _escape_specials 当成普通文本，
+        转义成 `&lt;\/msg&gt;` 后原样发出去，用户就在消息末尾看到一串
+        `<\/msg>` 乱码（即 issue 截图里的现象）。
+
+        只匹配 `<` + 反斜杠 + 可选 `/` + 合法标签名 + `>` 的形态；
+        且仅当该名字"确实像标签"（在已知名单里，或别处以正常形态出现过）
+        才还原，避免误伤 `C:\\dir` 之类的普通文本。
+
+        ⚠ 此步必须排在 _escape_code_fences 之后：围栏内此刻已是 `&lt;`，
+        因此代码里的 `<\/msg>` 作为原文保留，不会被改写。
+        """
+        def _repl(m):
+            slash, name = m.group(1), m.group(2)
+            if not self._is_tag_like(name, xml_str):
+                return m.group(0)
+            logger.debug(f"已还原反斜杠转义的标签 <\\{slash}{name}>")
+            return f"<{slash}{name}>"
+
+        return _BACKSLASH_TAG_RE.sub(_repl, xml_str)
+
+    def _fix_double_brackets_safe(self, xml_str: str) -> str:
+        """`<<msg` → `<msg`，但**不再无差别吞掉 `<<`**。
+
+        旧实现 `re.sub(r'<<(\\w+)', r'<\\1')` 不判断右侧是不是真标签，
+        会把普通文本里的比较/移位运算符一起吃掉：
+        `a<<b` → `a<b`（丢一个 `<`）、`1<<2` → `1<2`、`vector<<T>` → `vector<T>`。
+        这是内容损坏，不是修复。
+
+        新判据：仅当 `<<name` 的 name 确实是标签（在已知名单内，
+        或本文本别处存在同名闭合标签 `</name>`）时才折叠 ——
+        不能只看"别处有 `<name`"，那会被自身折叠结果带来自匹配。
+        """
+        if not self.fix_double_brackets:
+            return xml_str
+
+        def _repl(m):
+            name = m.group(1)
+            if self._is_tag_like(name, xml_str):
+                return f"<{name}"
+            return m.group(0)
+
+        return _DBL_ANGLE_RE.sub(_repl, xml_str)
+
     @staticmethod
     def _normalize_tag_name(item) -> str:
         """宽容地把用户盲填的内容归一化为纯标签名。
@@ -104,7 +313,37 @@ class XmlTagFixerPlugin(BasePlugin):
                     f"fallback={self.fallback_wrap_text}, no_wrap={sorted(self.no_wrap_tags)}, "
                     f"flatten={self.flatten_no_wrap_tags}, record_split={self.fix_record_split}, "
                     f"split_blank={self.split_blank_line_messages}, stray={self.handle_stray_content})")
+        self._run_config_migration()
         self._try_takeover_mimo()
+
+    def _run_config_migration(self):
+        """执行一次性配置迁移（幂等）。
+
+        只在本插件首次以 1.5.0 运行时生效一次；之后无论用户怎么改都不再干预。
+        迁移失败一律静默降级（保持原配置与原行为），绝不影响插件可用性。
+        """
+        try:
+            path = self._resolve_config_path()
+            if path is None:
+                logger.debug("[xml_tag_fixer] 无法定位插件配置文件，跳过迁移")
+                return
+            migrate_config_once(path)
+        except Exception as e:
+            logger.error(f"[xml_tag_fixer] 配置迁移异常（已忽略，保持原配置）: {e}")
+
+    @staticmethod
+    def _resolve_config_path():
+        """定位 data/config/plugins/xml_tag_fixer.json。
+
+        框架布局：`get_config_path()/plugins/<plugin_id>.json`
+        （见 core/plugin/plugin_registry.py 的 PLUGIN_CONFIG_DIR）。
+        只做定位，不做任何猜测性写入。
+        """
+        try:
+            from core.utils.path_utils import get_config_path
+            return get_config_path() / "plugins" / f"{PLUGIN_ID}.json"
+        except Exception:
+            return None
 
     async def terminate(self):
         logger.info("XmlTagFixerPlugin terminated")
@@ -158,7 +397,15 @@ class XmlTagFixerPlugin(BasePlugin):
     # ========== msg 外杂散内容：统一保护 / 分流 ==========
 
     # 成对的非 msg 标签块 <foo ...>...</foo>
-    _STRAY_PAIR_RE = re.compile(r"<([a-zA-Z][\w-]*)((?:\s[^>]*)?)>(.*?)</\1>", re.DOTALL)
+    # ⚠ 不能用 `(.*?)</\1>`：同名嵌套（<foo>a<foo>b</foo>c</foo>）时会把
+    #   内层闭合当成外层闭合，导致"合法输入被改成缺闭合标签"的硬回归
+    #   （整轮不可解析）。这里用"内部不得再出现同名开口"约束，逼匹配走最外层。
+    _STRAY_PAIR_RE = re.compile(
+        r"<([a-zA-Z][\w-]*)((?:\s[^>]*)?)>"
+        r"((?:(?!</?\1(?:\s[^>]*)?>).)*?)"
+        r"</\1>",
+        re.DOTALL,
+    )
     # 散段是「单个标签块」（成对或自闭合）的识别
     _STRAY_SINGLE_BLOCK_RE = re.compile(
         r"^<([a-zA-Z][\w-]*)(?:\s[^>]*)?>.*?</\1>$|^<([a-zA-Z][\w-]*)(?:\s[^>]*)?/>$", re.DOTALL)
@@ -185,6 +432,148 @@ class XmlTagFixerPlugin(BasePlugin):
         self_closing = len(re.findall(r"<msg(?:\s[^>]*)?/>", prefix))
         return opens - self_closing - prefix.count("</msg>") > 0
 
+    # ========== 可解析性硬闸门 ==========
+    #
+    # 框架侧（core/message_manager.py:send_xml_messages）对整段文本只有一次
+    # ET.fromstring 机会，解析失败就走 `logger.error("Error parsing message")`
+    # 直接 return []，**本轮一条消息都发不出去**。所以"输出必须可解析"是
+    # 本插件的最高不变量，任何修复分支都必须过这道闸。
+
+    # XML 1.0 不允许的控制字符（\t \n \r 除外）；留着会让框架解析整体失败
+    _ILLEGAL_XML_CHARS_RE = re.compile(
+        "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f\ufdd0-\ufdef\ufffe\uffff]"
+    )
+
+    @staticmethod
+    def _is_parseable(xml_str: str) -> bool:
+        """整段文本能否被框架的 <root> 包裹方式解析成功。"""
+        try:
+            ET.fromstring(f"<root>{xml_str}</root>")
+            return True
+        except Exception:
+            return False
+
+    def _sanitize_illegal_chars(self, s: str) -> str:
+        """剔除 XML 1.0 非法控制字符。仅在兜底/闸门阶段调用，正常路径不动用户内容。"""
+        return self._ILLEGAL_XML_CHARS_RE.sub("", s)
+
+    def _salvage_block(self, block: str) -> list:
+        """单块不可解析时的抢救：先剥壳清洗，仍不行就丢弃。
+
+        丢弃比原样透传安全得多 —— 原样透传会拖垮整轮解析（见 _is_parseable 注释）。
+        """
+        cleaned = self._fallback_wrap(block, allow_original=False)
+        for b in cleaned:
+            if self._is_parseable(b):
+                return [b]
+        logger.debug(f"闸门丢弃无法抢救的块: {block[:80]}")
+        return []
+
+    def _last_resort(self, xml_str: str) -> str:
+        """总闸门兜底的兜底：把整段当纯文本救成一条消息。
+
+        走到这里说明逐块修复全线失守。此时唯一还能保证的收益是"别把整轮弄没"，
+        因此剥掉全部结构性标签、剔除非法字符、整段转义成 <msg><text>。
+        若清洗后已无内容，返回空串 —— 空串让框架解析出 0 条消息并静默结束，
+        比发一条坏格式导致整轮丢弃损失更小。
+        """
+        text = xml_unescape(self._sanitize_illegal_chars(xml_str),
+                            {"&quot;": '"', "&apos;": "'"})
+        if "```" in text:
+            text = self._strip_outside_fences(text)
+        else:
+            text = self._strip_structural_tags(text)
+        # 残余的成对标签一律剥掉（此时不再区分注册与否）
+        text = re.sub(r"</?[a-zA-Z][\w-]*(?:\s[^<>]*)?/?>", "", text)
+        text = self._sanitize_illegal_chars(text).strip()
+        if not text:
+            logger.debug("总闸门清洗后无内容，本轮静默")
+            return ""
+        logger.warning("触发总闸门兜底：整段清洗为纯文本消息")
+        return f"<msg><text>{xml_escape(text)}</text></msg>"
+
+    def _split_msg_segments(self, xml_str: str) -> list:
+        """位置感知 + **嵌套深度感知** 的切块。
+
+        旧实现用 `find("</msg>")` 找闭合，遇到嵌套 <msg>（模型写草稿、示例、
+        或把 </text> 打字成 </msg>）会把内层 </msg> 误当成外层闭合，
+        切出的残片（如 `</text></msg>`）留在结果里 ⇒ 整轮不可解析。
+
+        这里按深度配对：只有深度回到 0 的那个 </msg> 才是真正的闭合。
+        返回 [(is_msg, text), ...]，msg 块与散段都保留，顺序不乱。
+        """
+        segments = []
+        pos = 0
+        length = len(xml_str)
+        while pos < length:
+            m = _MSG_OPEN_SEARCH_RE.search(xml_str, pos)
+            if not m:
+                tail = xml_str[pos:]
+                if tail.strip():
+                    segments.append((False, tail))
+                break
+            if m.start() > pos:
+                gap = xml_str[pos:m.start()]
+                if gap.strip():
+                    segments.append((False, gap))
+            if m.group(1) == "/":
+                # 自闭合 <msg/> 或 <msg .../>：独立成块。
+                # 空消息 <msg/> 是合法的「静默」操作，原样透传：
+                # 框架会自行优雅处理，下游插件和记忆持久化都依赖这个标记
+                segments.append((True, m.group(0)))
+                pos = m.end()
+                continue
+            depth = 1
+            scan = m.end()
+            closed = False
+            while depth > 0:
+                nxt = _MSG_ANY_SEARCH_RE.search(xml_str, scan)
+                if not nxt:
+                    break
+                if nxt.group(0).startswith("</"):
+                    depth -= 1
+                    if depth == 0:
+                        segments.append((True, xml_str[m.start():nxt.end()]))
+                        pos = nxt.end()
+                        closed = True
+                        break
+                elif nxt.group(1) == "/":
+                    pass  # 嵌套的自闭合 msg 不改变深度
+                else:
+                    depth += 1
+                scan = nxt.end()
+            if not closed:
+                # 未闭合：截断为独立块，交给修复/兜底
+                segments.append((True, xml_str[m.start():]))
+                pos = length
+        return segments
+
+    @staticmethod
+    def _find_matching_close(tag: str, s: str, start: int) -> Optional[int]:
+        """从 `start` 起为标签 `tag` 找"配对的那一个" `</tag>`，返回其起始下标。
+
+        必须做深度配对：同名嵌套时（`<record a><record b>`）第一个 `</record>`
+        关闭的是**内层**，用 `f"</{tag}>" in rest` 这种全局包含判断会误判成已关闭。
+        """
+        opens = re.compile(rf"<{re.escape(tag)}(?:\s[^>]*?)?(/?)>")
+        depth = 1
+        pos = start
+        while pos < len(s):
+            nxt = opens.search(s, pos)
+            close_idx = s.find(f"</{tag}>", pos)
+            if close_idx == -1:
+                return None
+            if nxt and nxt.start() < close_idx:
+                if nxt.group(1) != "/":
+                    depth += 1
+                pos = nxt.end()
+                continue
+            depth -= 1
+            if depth == 0:
+                return close_idx
+            pos = close_idx + len(tag) + 3
+        return None
+
     def _handle_unclosed_tail(self, xml_str: str) -> str:
         """处理 root 级未闭合的非 msg 标签尾巴。
 
@@ -192,20 +581,40 @@ class XmlTagFixerPlugin(BasePlugin):
         未注册标签（reasoning 等）：剥到末尾——其后可能混着真消息，无法安全切分，
         且框架原生遇到未闭合会整段解析失败，剥离是损失更小的选择；
         msg 内部的未闭合标签不动（留给解析失败 → 兜底管线）。
+
+        两个必须注意的点：
+        1. **必须循环**：旧版处理完第一个就 return，多标签场景
+           （如 `<record url="a"><record url="b">`）留下嵌套未闭合标签
+           ⇒ 最终仍不可解析。这里补到再无可补为止（带上限防死循环）。
+        2. **闭合判断必须做深度配对**：同名嵌套时第一个 `</record>` 关的是内层，
+           用 `f"</{tag}>" in rest` 这种全局包含判断会把内层误当成外层已闭合。
+        3. **补闭合要考虑嵌套深度**：`<record a><record b>` 需要补两次，
+           只补一次仍然不平衡。
         """
-        for m in self._TAG_OPEN_RE.finditer(xml_str):
-            tag = m.group(1)
-            if tag == "msg" or m.group(2) == "/":
-                continue
-            if f"</{tag}>" in xml_str[m.end():]:
-                continue
-            if self._inside_msg(xml_str[:m.start()]):
-                continue
+        for _ in range(64):
+            target = None
+            for m in self._TAG_OPEN_RE.finditer(xml_str):
+                tag = m.group(1)
+                if tag == "msg" or m.group(2) == "/":
+                    continue
+                # 该开口有没有配对的闭合（深度配对，不是全局包含）
+                if self._find_matching_close(tag, xml_str, m.end()) is not None:
+                    continue
+                if self._inside_msg(xml_str[:m.start()]):
+                    continue
+                target = (m, tag)
+                break
+            if target is None:
+                break
+            m, tag = target
             if tag in self._registered_msg_tags or tag in self._registered_root_tags or tag in self.no_wrap_tags:
-                logger.debug(f"已补全未闭合的 root 级标签 <{tag}>")
-                return xml_str + f"</{tag}>"
-            logger.debug(f"已剥离未闭合的 root 级 <{tag}> 尾巴（其后内容无法安全切分）")
-            return xml_str[:m.start()]
+                # 每轮只补一个闭合，循环会重新做深度配对检查 ——
+                # 同名嵌套时这样能自然逐层补齐，计数法反而会多补。
+                logger.debug(f"已补全 root 级未闭合标签 <{tag}>")
+                xml_str = xml_str + f"</{tag}>"
+            else:
+                logger.debug(f"已剥离未闭合的 root 级 <{tag}> 尾巴（其后内容无法安全切分）")
+                xml_str = xml_str[:m.start()]
         return xml_str
 
     def _protect_stray_blocks(self, xml_str: str) -> str:
@@ -228,6 +637,40 @@ class XmlTagFixerPlugin(BasePlugin):
             inner = xml_unescape(inner, {"&quot;": '"', "&apos;": "'"})
             return f"<{tag}{attrs}>{xml_escape(inner)}</{tag}>"
         return self._STRAY_PAIR_RE.sub(_repl, xml_str)
+
+    @staticmethod
+    def _stray_block_tag(seg: str) -> Optional[str]:
+        """若散段是单个标签块，返回其标签名；否则 None。"""
+        m = XmlTagFixerPlugin._STRAY_SINGLE_BLOCK_RE.match(seg)
+        return (m.group(1) or m.group(2)) if m else None
+
+    def _is_lost_functional_tag(self, seg: str) -> bool:
+        """该散段是「不应被丢弃的功能性内容」吗。
+
+        关闭「处理 msg 外杂散内容」时，旧行为会把 msg 之间的散段整体丢弃。
+        但其中两类散段是**真实的修复目标**，丢掉等于功能静默失效：
+
+        1. **忘带 msg 的已注册功能标签** —— 模型忘了给语音/图片/@/表情包
+           `<msg>`（如 `<record url="a.silk"/><msg>…</msg>`）。丢掉它用户
+           发了语音却没声音。
+        2. **含 `[xxx]` 式标记的文本** —— 折扇留穗等插件靠 `[3p]…[/3p]`
+           这类**跨消息**标记对工作（README 已列为支持的互操作）。
+           标记被丢弃会让下游插件无法识别。
+
+        这两类与"模型心声"的区别很明确：前者是框架会真正消费的结构化内容，
+        后者是其他插件约定的协议标记；而裸文本（旁白/规划）正是总开关要挡的。
+        所以只放行前两类，裸文本仍按旧行为丢弃。
+        """
+        tag = self._stray_block_tag(seg)
+        if tag:
+            if tag in self._registered_root_tags:
+                return True
+            if tag in self._registered_msg_tags or tag in self.no_wrap_tags:
+                return True
+        # 含 [xxx] / [/xxx] 协议标记的文本（折扇留穗等插件依赖）
+        if self.merge_marker_span_msgs and self._BBCODE_MARKER_RE.search(seg):
+            return True
+        return False
 
     def _fix_stray_segment(self, seg: str) -> list:
         """处理 msg 之外的散段，按内容身份分流（对齐框架原生语义）：
@@ -266,15 +709,25 @@ class XmlTagFixerPlugin(BasePlugin):
     # ========== 原有修复逻辑 ==========
 
     def _fix_at_tags(self, elem: ET.Element) -> None:
+        """`<at user_id="123"/>` → `<at>123</at>`。
+
+        ⚠ 旧版的分支写法有死代码（`elif` 条件与 `if` 完全相同，永远进不去），
+        且当 `<at>` 同时带 user_id 和文本时**静默丢弃原文本**。
+        现在两者都带上时优先保 user_id（id 才是 @ 的目标），
+        但把原文本记录到 debug 日志便于排查。
+        """
         if not self.fix_at_tag_format:
             return
         for child in elem.iter():
-            if child.tag == "at":
-                if child.attrib.get("user_id"):
-                    qq = child.attrib.pop("user_id")
-                    child.text = qq
-                elif child.attrib.get("user_id") and child.text:
-                    child.attrib.pop("user_id")
+            if child.tag != "at":
+                continue
+            qq = child.attrib.pop("user_id", None)
+            if qq is None:
+                continue
+            if child.text and child.text.strip() and child.text.strip() != qq:
+                # 形如 <at user_id="123">456</at>：模型给了两个目标，以 user_id 为准
+                logger.debug(f"at 标签同时含 user_id={qq} 与文本 {child.text!r}，取 user_id")
+            child.text = qq
 
     def _flatten_no_wrap(self, elem: ET.Element) -> None:
         """把 no_wrap_tags 名单内标签里被模型错误嵌套的子标签剥成纯文本。
@@ -319,8 +772,15 @@ class XmlTagFixerPlugin(BasePlugin):
             modified = True
 
         children = list(elem)
-        for i, child in enumerate(children):
+        # ⚠ 旧版用 `elem.insert(i + 1, ...)` 就地插入，但 i 来自插入前拍下的
+        # children 快照 —— 每插一个 tail，后面所有子元素的真实下标就 +1，
+        # 于是后续 tail 被插到错误位置，**消息内容顺序被打乱**
+        # （实测 <msg><foo>x</foo>t1<bar>y</bar>t2</msg> → [foo, text(t1), text(t2), bar]，
+        # t2 跑到了 <bar> 前面）。改为重建子列表，顺序严格保持。
+        rebuilt = []
+        for child in children:
             if not self.fix_at_tag_format and child.tag in self.IGNORE_TAGS:
+                rebuilt.append(child)
                 continue
 
             if child.tag not in self.IGNORE_TAGS and child.tag not in self.no_wrap_tags:
@@ -331,14 +791,120 @@ class XmlTagFixerPlugin(BasePlugin):
                 if self._wrap_text_in_element(child, child_wrap):
                     modified = True
 
+            rebuilt.append(child)
+
             if wrap_here and child.tail and child.tail.strip():
                 tail_text = ET.Element("text")
                 tail_text.text = child.tail
                 child.tail = None
-                elem.insert(i + 1, tail_text)
+                rebuilt.append(tail_text)
                 modified = True
 
+        if rebuilt != children:
+            for c in children:
+                elem.remove(c)
+            for c in rebuilt:
+                elem.append(c)
+
         return modified
+
+    def _lift_nested_text_content(self, root: ET.Element) -> bool:
+        """把 <text> 内部嵌着的子元素"提出来"，让它们的内容能真正发出去。
+
+        框架 _parse_xml_msg 只读 msg **直接子元素**的**直接文本**
+        （`value = child.text.strip() if child.text else ""`），
+        所以嵌在 <text> 里的子元素及其 tail 用户完全看不到。实测：
+
+            <msg><text>要写成 <msg><text>你好</text></msg> 这样</text></msg>
+            → 用户只看到「要写成」（"你好" 和 " 这样" 都丢了）
+
+        模型解释标签用法时会写出这种嵌套，属于真实场景。
+
+        两个关键点：
+        1. 嵌套的 **<msg> 必须"拆壳"**：msg 不是注册标签，框架遍历 msg 的
+           子元素时遇到 <msg> 会整块跳过 ⇒ 里面的文字照样丢。所以要把嵌套 msg
+           的**内容**（text / 子元素 / tail）原样摊平进外层，而不是保留这层壳。
+        2. 顺序与 tail 都要保：按文档顺序重建，原 <text> 自身的 tail 也接住。
+
+        仅对 <text> 生效 —— 其他标签的子元素可能有语义（如 img 的 path），不能动。
+        """
+        modified = False
+        for child in list(root):
+            if child.tag != "text" or not len(child):
+                continue
+            outer_tail = child.tail
+            pieces = []          # ("text", str) 或 ("elem", Element)
+
+            def emit_elem(el):
+                """把子元素加入片段流；可"拆壳"的标签递归摊平。"""
+                # msg：非注册标签，框架遍历 msg 子元素时遇到它会整块跳过
+                # text：框架只读它的直接文本，嵌套内容同样看不到
+                # 两者都必须拆壳，把内容按序摊平进外层
+                if el.tag in ("msg", "text"):
+                    if el.text and el.text.strip():
+                        pieces.append(("text", el.text))
+                    for sub in list(el):
+                        # ⚠ 必须先取出 sub.tail：emit_elem 对非拆壳元素会清空它，
+                        # 之后再也读不到（曾漏掉 "A<msg><text>B</text>C</msg>D" 里的 C）
+                        sub_tail = sub.tail
+                        sub.tail = None
+                        emit_elem(sub)
+                        if sub_tail:
+                            pieces.append(("text", sub_tail))
+                    return
+                el.tail = None
+                pieces.append(("elem", el))
+
+            buf = child.text or ""
+
+            def flush():
+                if buf.strip():
+                    pieces.append(("text", buf))
+
+            for sub in list(child):
+                flush()
+                sub_tail = sub.tail or ""
+                emit_elem(sub)
+                buf = sub_tail
+            flush()
+
+            if not pieces:
+                continue
+
+            idx = list(root).index(child)
+            root.remove(child)
+            node_idx = idx
+            for kind, val in pieces:
+                if kind == "text":
+                    te = ET.Element("text")
+                    te.text = val
+                    root.insert(node_idx, te)
+                else:
+                    root.insert(node_idx, val)
+                node_idx += 1
+            if outer_tail:
+                # 原 <text> 的 tail 接到最后一个新节点，内容不丢
+                root[node_idx - 1].tail = outer_tail
+            modified = True
+            logger.debug(f"已提升 <text> 内部嵌套元素（{len(pieces)} 个片段）")
+
+        # 子元素提升后可能出现相邻的 <text>，合并以免碎片化
+        if modified:
+            self._merge_adjacent_text(root)
+        return modified
+
+    @staticmethod
+    def _merge_adjacent_text(root: ET.Element) -> None:
+        """合并相邻的 <text> 子元素（仅当它们都没有子元素时），避免消息碎裂。"""
+        prev = None
+        for child in list(root):
+            if (prev is not None and prev.tag == "text" and child.tag == "text"
+                    and not len(prev) and not len(child)):
+                prev.text = (prev.text or "") + (child.text or "")
+                prev.tail = child.tail
+                root.remove(child)
+                continue
+            prev = child
 
     def _extract_at_from_text(self, root: ET.Element) -> bool:
         """把 text 内嵌套的 <at> 提升为 msg 直接子元素。
@@ -348,6 +914,10 @@ class XmlTagFixerPlugin(BasePlugin):
         这里把 text 按 at 拆分：at 提升为 msg 直接子元素，其余文字按原顺序
         拆成多个 text 包回原位置，顺序不变。
         仅处理 text 直接子级的 at；更深层嵌套（如 text > foo > at）不动。
+
+        ⚠ 旧版把 text 元素自身的 tail（`<text>...</text>后面这段`）丢了 ——
+        拆分后只搬 text/at 子节点，没搬外层 tail ⇒ 内容静默丢失。
+        这里把 tail 一起搬到最后一个新节点上。
         """
         modified = False
         for child in list(root):
@@ -355,6 +925,7 @@ class XmlTagFixerPlugin(BasePlugin):
                 continue
             if not any(sub.tag == "at" for sub in child):
                 continue
+            outer_tail = child.tail
             new_nodes = []
             text_buf = child.text or ""
             at_count = 0
@@ -379,6 +950,9 @@ class XmlTagFixerPlugin(BasePlugin):
             root.remove(child)
             for j, node in enumerate(new_nodes):
                 root.insert(idx + j, node)
+            if outer_tail:
+                # 把原 text 的 tail 接到最后一个新节点，保持内容不丢
+                new_nodes[-1].tail = outer_tail
             modified = True
         return modified
 
@@ -388,7 +962,14 @@ class XmlTagFixerPlugin(BasePlugin):
         规则：
         - @ 前后不能是字母、数字、下划线、点号
         - 数字至少 4 位（避免误转换短数字）
-        - 排除邮箱地址（@数字.后缀）通过负向先行断言实现
+        - 排除邮箱地址（@数字.后缀）
+
+        ⚠ 旧版用 `re.split` 切段后**对每一段单独跑含 lookbehind 的正则**，
+        上下文在切分处被切断 ⇒ 边界判据失效。实测：
+        `@12345678 和 abc@12345678 都在这` → 两个都转成 at，
+        第二个本该被 `abc` 挡住；邮箱 `x@12345678.com` 也会被误转。
+        现在改为一次 `finditer` 扫描原文，**在原文位置做全部判据**，
+        再按匹配区间切段重建，上下文不再丢失。
         """
         if not self.convert_text_at_to_tag:
             return
@@ -397,51 +978,59 @@ class XmlTagFixerPlugin(BasePlugin):
         for child in list(elem):
             self._convert_text_at_in_element(child, elem)
 
-        if elem.tag == "text" and elem.text:
-            txt = elem.text
+        if elem.tag != "text" or not elem.text:
+            return
 
-            # 构建排除域名后缀的正则
-            domains_pattern = '|'.join(re.escape(d) for d in self.text_at_exclude_domains)
-            # 核心正则：
-            # - 前后边界：前面不能是字母数字下划线点号，后面不能是字母数字下划线点号
-            # - 数字至少 4 位
-            # - 负向先行断言排除邮箱：@数字 后面不能直接跟 .后缀 (且后缀后跟单词边界或结束)
-            pattern = rf'(?<![A-Za-z0-9_.])@(\d{{4,}})(?![A-Za-z0-9_.])(?!\.(?:{domains_pattern})(?:\b|$))'
+        txt = elem.text
+        domains = [d for d in (self.text_at_exclude_domains or []) if d]
+        domains_pattern = '|'.join(re.escape(d) for d in domains) if domains else None
 
-            if not re.search(pattern, txt):
-                return
+        # 前边界：不能是字母数字下划线点号（避免 abc@ / a.b@）
+        # 后边界：不能是字母数字下划线点号（避免 @12345678x）
+        # 邮箱排除：@数字 后面若紧跟 .顶级域 则不是 at
+        def _is_email_like(end: int) -> bool:
+            if not domains_pattern:
+                return False
+            rest = txt[end:]
+            m = re.match(rf'\.(?:{domains_pattern})(?:\b|$)', rest, re.IGNORECASE)
+            return bool(m)
 
-            # 使用保留分隔符的方式分割
-            parts = re.split(rf'(@\d{{4,}})', txt)
+        matches = []
+        for m in re.finditer(r'@(\d{4,})', txt):
+            start, end = m.start(), m.end()
+            if start > 0 and re.match(r'[A-Za-z0-9_.]', txt[start - 1]):
+                continue
+            if _is_email_like(end):
+                continue
+            matches.append((start, end, m.group(1)))
 
-            new_nodes = []
-            for part in parts:
-                if not part:
-                    continue
-                m = re.match(r'@(\d{4,})', part)
-                if m:
-                    # 再次验证是否符合完整规则
-                    if re.search(pattern, part):
-                        at_elem = ET.Element("at")
-                        at_elem.text = m.group(1)
-                        new_nodes.append(at_elem)
-                    else:
-                        new_text = ET.Element("text")
-                        new_text.text = part
-                        new_nodes.append(new_text)
-                else:
-                    new_text = ET.Element("text")
-                    new_text.text = part
-                    new_nodes.append(new_text)
+        if not matches:
+            return
 
-            if len(new_nodes) == 1 and new_nodes[0].tag == "text":
-                return
+        new_nodes = []
+        cursor = 0
+        for start, end, num in matches:
+            if start > cursor:
+                seg = ET.Element("text")
+                seg.text = txt[cursor:start]
+                new_nodes.append(seg)
+            at_elem = ET.Element("at")
+            at_elem.text = num
+            new_nodes.append(at_elem)
+            cursor = end
+        if cursor < len(txt):
+            seg = ET.Element("text")
+            seg.text = txt[cursor:]
+            new_nodes.append(seg)
 
-            if parent is not None:
-                idx = list(parent).index(elem)
-                parent.remove(elem)
-                for node in reversed(new_nodes):
-                    parent.insert(idx, node)
+        if len(new_nodes) == 1 and new_nodes[0].tag == "text":
+            return
+
+        if parent is not None:
+            idx = list(parent).index(elem)
+            parent.remove(elem)
+            for node in reversed(new_nodes):
+                parent.insert(idx, node)
 
     # ========== 空行分段拆消息 ==========
 
@@ -490,8 +1079,13 @@ class XmlTagFixerPlugin(BasePlugin):
     # ========== 跨消息标记对合并 ==========
 
     def _try_merge_text_blocks(self, blocks: list) -> Optional[str]:
-        """尝试把多个 msg 块合并为一条纯文本 msg；任一块含非 text 子元素或无法解析则放弃。"""
+        """尝试把多个 msg 块合并为一条纯文本 msg；任一块含非 text 子元素或无法解析则放弃。
+
+        ⚠ 旧版只取 `c.text`，丢了每个 text 子元素的 `tail`（块内散落文字）
+        ⇒ 合并后内容静默丢失。这里把 text 与 tail 一并收集，并保留 msg 属性。
+        """
         texts = []
+        attrs = {}
         for b in blocks:
             try:
                 root = ET.fromstring(b)
@@ -502,9 +1096,21 @@ class XmlTagFixerPlugin(BasePlugin):
             children = list(root)
             if not children or any(c.tag != "text" for c in children):
                 return None
-            part = "".join(c.text or "" for c in children).strip()
-            texts.append(part)
+            parts = []
+            for c in children:
+                if c.text:
+                    parts.append(c.text)
+                if c.tail:
+                    # 块内 tail 也是消息内容，不能丢
+                    parts.append(c.tail)
+            texts.append("".join(parts).strip())
+            if not attrs:
+                attrs = dict(root.attrib)
+        # 合并后 message_id 已无意义（会由框架重新分配），剔除旧值避免误导
+        attrs.pop("message_id", None)
         msg = ET.Element("msg")
+        for k, v in attrs.items():
+            msg.set(k, v)
         te = ET.SubElement(msg, "text")
         te.text = "\n\n".join(t for t in texts if t)
         return ET.tostring(msg, encoding="unicode", method="xml")
@@ -575,7 +1181,7 @@ class XmlTagFixerPlugin(BasePlugin):
             parts[i] = self._strip_structural_tags(parts[i])
         return "```".join(parts)
 
-    def _fallback_wrap(self, original_block: str) -> list:
+    def _fallback_wrap(self, original_block: str, allow_original: bool = False) -> list:
         """所有修复手段都失败时，清洗为纯文本消息。
 
         两种模式（fallback_strip_tags 控制）：
@@ -585,6 +1191,11 @@ class XmlTagFixerPlugin(BasePlugin):
           适合 payload/注入测试等要求逐字保真的场景。
         保证消息能发出去，且进入记忆的永远是良构 XML。
         注意基于未转义的原始块处理，避免双重转义。
+
+        ⚠ allow_original 默认 False：旧实现在"清洗后为空"时把**原始坏块**
+        原样返回，等于把不可解析的残片（如 `</text></msg>`）直接塞回结果
+        ⇒ 拖垮整轮解析 ⇒ 本轮一条消息都发不出去。现在改为返回空列表丢弃；
+        若整轮都被丢弃，外层总闸门 _last_resort 还会兜一次。
         """
         if not self.fallback_wrap_text:
             return [original_block]
@@ -601,14 +1212,19 @@ class XmlTagFixerPlugin(BasePlugin):
             # 保真模式：只去掉最外层 msg 包裹，其余原样保留
             inner = re.sub(r"^<msg[^>]*>", "", inner)
             inner = re.sub(r"</msg>\s*$", "", inner).strip()
+        # XML 1.0 非法控制字符会让框架解析整体失败，必须剔除
+        inner = self._sanitize_illegal_chars(inner)
         if not inner:
-            return [original_block]
+            if allow_original:
+                return [original_block]
+            logger.debug(f"兜底清洗后无内容，丢弃该块（避免残片拖垮整轮）: {original_block[:80]}")
+            return []
         logger.debug(f"触发终极兜底，清洗为纯文本消息: {original_block[:80]}")
         return [f"<msg><text>{xml_escape(inner)}</text></msg>"]
 
     def _fix_single_msg(self, msg_str: str) -> list:
         if self.fix_double_brackets:
-            msg_str = re.sub(r'<<(\w+)', r'<\1', msg_str)
+            msg_str = self._fix_double_brackets_safe(msg_str)
 
         original = msg_str
         msg_str = self._escape_specials(msg_str)
@@ -621,6 +1237,8 @@ class XmlTagFixerPlugin(BasePlugin):
                 root = ET.fromstring(msg_str)
                 if root.tag != "msg":
                     return [msg_str]
+                # 与主路径保持一致：先提升 <text> 内嵌套内容，避免被拆分后丢失
+                self._lift_nested_text_content(root)
                 poke_elem = None
                 text_elems = []
                 for child in root:
@@ -657,6 +1275,9 @@ class XmlTagFixerPlugin(BasePlugin):
                 root = ET.fromstring(msg_str)
                 if root.tag == "msg":
                     self._fix_at_tags(root)
+                    # ★ 必须早于 _extract_at_from_text / _wrap_text_in_element：
+                    # 后两者会调整子元素顺序，届时已无法重建正确的文本顺序
+                    self._lift_nested_text_content(root)
                     if self.extract_at_from_text:
                         self._extract_at_from_text(root)
                     self._flatten_no_wrap(root)
@@ -674,51 +1295,58 @@ class XmlTagFixerPlugin(BasePlugin):
                 return self._fallback_wrap(original)
 
     def fix_xml(self, xml_str: str) -> str:
+        """入口：反斜杠形态有歧义时跑两条路径，选更能保住消息的那条。"""
         xml_str = self._escape_code_fences(xml_str)
+        if self.fix_backslash_tags and _BACKSLASH_TAG_RE.search(xml_str):
+            restored_raw = self._apply_backslash_tags(xml_str)
+            if restored_raw != xml_str:
+                keep_token = self._fix_xml_core(xml_str)          # 当作正文，保留 token
+                as_tag = self._fix_xml_core(restored_raw)         # 当作真标签
+                return self._pick_backslash_interpretation(keep_token, as_tag)
+        return self._fix_xml_core(xml_str)
+
+    @staticmethod
+    def _count_msgs(xml_text: str) -> int:
+        try:
+            return len(ET.fromstring(f"<root>{xml_text}</root>").findall("msg"))
+        except Exception:
+            return -1
+
+    def _pick_backslash_interpretation(self, keep_token: str, as_tag: str) -> str:
+        r"""`<\/msg>` 有两种解释：模型打错的真闭合标签 / 正文里讨论的术语。
+
+        判据（按优先级）：
+        1. 「当作真标签」不可解析而「保留 token」可解析
+           ⇒ 还原会弄坏结果，保留 token（它其实是正文）；
+        2. 「当作真标签」把消息**切碎成更多条**
+           ⇒ 说明它并不是在闭合当前结构，而是正文里的字面量，保留 token；
+        3. 否则 ⇒ 按真标签处理（这正是用户遇到的现象：末尾冒 <\/msg> 乱码）。
+        """
+        keep_ok = self._is_parseable(keep_token)
+        tag_ok = self._is_parseable(as_tag)
+        if keep_ok and not tag_ok:
+            logger.debug("反斜杠标签还原后不可解析，按正文处理（保留 token）")
+            return keep_token
+        if keep_ok and tag_ok:
+            n_keep = self._count_msgs(keep_token)
+            n_tag = self._count_msgs(as_tag)
+            if n_keep >= 0 and n_tag > n_keep:
+                logger.debug("反斜杠标签会切碎消息，按正文处理（保留 token）")
+                return keep_token
+        return as_tag
+
+    def _fix_xml_core(self, xml_str: str) -> str:
         if self.handle_stray_content:
             xml_str = self._handle_unclosed_tail(xml_str)
             xml_str = self._protect_stray_blocks(xml_str)
-        if self.fix_double_brackets:
-            xml_str = re.sub(r'<<(\w+)', r'<\1', xml_str)
+        xml_str = self._fix_double_brackets_safe(xml_str)
 
         if xml_str.strip().startswith("[") and ("Error" in xml_str or "error" in xml_str):
             return xml_str
 
-        # 位置感知切块：msg 块与散段（msg 前/之间/之后的内容）都保留，顺序不乱
-        segments = []  # (is_msg, text)
-        start_pos = 0
-        while True:
-            idx = xml_str.find("<msg", start_pos)
-            if idx == -1:
-                tail = xml_str[start_pos:]
-                if tail.strip():
-                    segments.append((False, tail))
-                break
-            if idx > start_pos:
-                gap = xml_str[start_pos:idx]
-                if gap.strip():
-                    segments.append((False, gap))
-            open_end = xml_str.find(">", idx)
-            if open_end == -1:
-                segments.append((True, xml_str[idx:]))
-                break
-            if xml_str[open_end - 1] == "/":
-                # 自闭合 <msg/> 或 <msg .../>：独立成块，避免吞掉后续消息。
-                # 空消息 <msg/> 是合法的「静默」操作，原样透传：框架会自行优雅处理，
-                # 下游插件和记忆持久化都依赖这个标记
-                segments.append((True, xml_str[idx:open_end + 1]))
-                start_pos = open_end + 1
-                continue
-            end_idx = xml_str.find("</msg>", open_end + 1)
-            next_open = xml_str.find("<msg", open_end + 1)
-            if end_idx == -1 or (next_open != -1 and next_open < end_idx):
-                # 未正常闭合（没有 </msg> 或闭合前出现新 <msg）：截断为独立块，走修复/兜底
-                cut = next_open if next_open != -1 else len(xml_str)
-                segments.append((True, xml_str[idx:cut]))
-                start_pos = cut
-                continue
-            segments.append((True, xml_str[idx:end_idx + 6]))
-            start_pos = end_idx + 6
+        # 位置感知 + 嵌套深度感知切块：msg 块与散段（msg 前/之间/之后的内容）
+        # 都保留，顺序不乱；嵌套 <msg> 由 _split_msg_segments 按深度配对处理
+        segments = self._split_msg_segments(xml_str)
 
         fixed_blocks = []
         last_idx = len(segments) - 1
@@ -730,13 +1358,40 @@ class XmlTagFixerPlugin(BasePlugin):
                 fixed_blocks.extend(self._fix_single_msg(seg))
             elif self.handle_stray_content:
                 fixed_blocks.extend(self._fix_stray_segment(seg))
+            elif self._is_lost_functional_tag(seg):
+                # 关闭总开关时仍补包「忘带 msg 的已注册功能标签」——
+                # 语音/图片/@/表情是真实的修复目标，不是"心声"，
+                # 丢弃它们属于功能静默丢失。这是细粒度分流：
+                # 只丢裸文本（疑似心声），保功能标签。
+                tag = self._stray_block_tag(seg)
+                logger.debug(f"补包忘带 msg 的功能标签 <{tag}>（散段处理已关闭）")
+                fixed_blocks.extend(self._fix_single_msg(f"<msg>{seg}</msg>"))
             elif i == last_idx:
                 # 开关关闭时保持旧行为：只有末尾残余散段会被救回，其余丢弃
                 fixed_blocks.extend(self._fix_single_msg(seg))
             else:
                 logger.debug(f"已丢弃 msg 外的散段: {seg[:60]}")
         fixed_blocks = self._merge_marker_spanning_blocks(fixed_blocks)
-        return "\n".join(fixed_blocks)
+
+        # ---- 逐块闸门：任何单块不可解析都不能进入最终结果 ----
+        # 框架只有一次 ET.fromstring 机会，一块坏 = 整轮零消息。
+        # 抢救（剥壳清洗）→ 仍不行则丢弃。
+        gated = []
+        for b in fixed_blocks:
+            if self._is_parseable(b):
+                gated.append(b)
+            else:
+                logger.debug(f"闸门拦截不可解析块，尝试抢救: {b[:80]}")
+                gated.extend(self._salvage_block(b))
+        fixed_blocks = gated
+
+        result = "\n".join(fixed_blocks)
+
+        # ---- 总闸门：整轮级别的不变量 ----
+        if not self._is_parseable(result):
+            logger.warning("最终结果仍不可解析，启用总闸门兜底")
+            return self._last_resort(result)
+        return result
 
     @on.llm_response(priority=Priority.HIGH)
     async def on_llm_response(self, event: KiraMessageBatchEvent, resp: LLMResponse):
@@ -815,7 +1470,12 @@ class XmlTagFixerPlugin(BasePlugin):
             # 回复需保持在消息最前，@ 其次，其余按原相对顺序
             stray.sort(key=lambda x: 0 if isinstance(x, Reply) else 1)
             real_runs[0] = stray + real_runs[0]
-        # 没有文字内容时 stray 直接丢弃
+        elif stray:
+            # 这是**刻意的取舍**（见 README：只有语音时丢弃 @/回复，
+            # 保证语音消息绝对干净 —— QQ 侧语音与 @/回复混在同条会显示异常）。
+            # 只补一条 debug 日志，让"@ 消失"这件事可观测、可排查，
+            # 不改变既有行为。
+            logger.debug(f"消息仅含语音，按既有约定丢弃 {len(stray)} 个 @/回复元素")
 
         # 按原顺序重组：文字链和语音链的先后关系保持不变
         ordered = []
