@@ -21,7 +21,13 @@
     "name": "修复双尖括号",
     "type": "switch",
     "default": true,
-    "hint": "将 <<msg 修复为 <msg, <<function_calls 修复为 <function_calls 等"
+    "hint": "将 <<msg 修复为 <msg。仅当尖括号右边的名字确实是标签（在已知标签名单里，或文本别处存在同名闭合标签）时才折叠，不会再吃掉正文里的比较/移位运算符（如 a<<b、1<<2、vector<<T>）"
+  },
+  "fix_backslash_tags": {
+    "name": "修复反斜杠转义的标签",
+    "type": "switch",
+    "default": true,
+    "hint": "将 <\\/msg>、<\\msg> 这类被反斜杠转义的标签定界符还原成真标签。模型从 JSON/正则习惯串味时常写出 <\\/msg>，旧版会把它当普通文本转义成 &lt;\\/msg&gt; 直接发给用户（消息末尾冒出乱码）。还原判据同样要求名字确实像标签，代码围栏内的原文不受影响"
   },
   "escape_special_chars": {
     "name": "转义裸特殊字符",
@@ -62,7 +68,10 @@
   "wrap_mode": {
     "name": "text 包裹模式",
     "type": "enum",
-    "options": ["blacklist", "whitelist"],
+    "options": [
+      "blacklist",
+      "whitelist"
+    ],
     "default": "blacklist",
     "hint": "blacklist（默认）：已包裹在其他标签里的内容保持原样，只有 msg 下落单的文字和「强制包裹黑名单」内标签的文字会被包进 <text>，不会再误伤其他插件的自定义标签；whitelist：旧版行为，除内置标签和下方不包裹名单外的所有标签内容都会被包进 <text>，自定义标签多的环境容易出现内容静默丢失"
   },
@@ -74,7 +83,9 @@
   },
   "no_wrap_tags": {
     "type": "list",
-    "default": ["mimo_tts"],
+    "default": [
+      "mimo_tts"
+    ],
     "hint": "不包裹 <text> 的自定义标签名单，填纯标签名即可（如 mimo_tts），带不带尖括号都能识别。mimo_tts 始终内置保护，可自行追加其他插件的标签。黑名单模式下默认就不包裹任何标签，此名单主要作为下方「摊平嵌套」和白名单模式的赦免名单"
   },
   "flatten_no_wrap_tags": {
@@ -98,8 +109,8 @@
   "strip_reasoning_block": {
     "name": "处理 msg 外杂散内容",
     "type": "switch",
-    "default": true,
-    "hint": "处理 <msg> 之外的内容（杂散文字、reasoning/think 等伪思考标签、未注册未知标签、忘包 msg 的功能标签）。开启后（默认）：杂散文字包成消息发出；已注册功能标签（file/record/mimo_tts 等）内容零转义、忘包 msg 的自动补包生效；未注册标签内部转义后原位保留（用户不可见但进记忆，伪思考约定不失传）；未闭合的注册标签补全闭合、未闭合的未注册尾巴剥离。关闭则回到旧行为：msg 外的内容除末尾残段外一律丢弃，且思考块里的 <msg> 草稿可能误发"
+    "default": false,
+    "hint": "处理 <msg> 之外的内容。关闭（1.5.0 起默认）：msg 外的裸文本（模型的规划/旁白/心声）不发出去，避免暴露思考过程；但「忘带 msg 的已注册功能标签」（语音/图片/@/表情）仍会自动补包，修复能力不受影响。开启：msg 外的散文字也会包成消息发出（会看到模型的心声，如「让我想想…我该查一下」），另外 reasoning/think 等未注册标签内部转义后原位保留、忘包 msg 的功能标签补包、未闭合注册标签补全。"
   },
   "merge_marker_span_msgs": {
     "name": "合并跨消息的 [xxx] 标记对",
@@ -115,7 +126,21 @@
   },
   "text_at_exclude_domains": {
     "type": "list",
-    "default": ["com", "cn", "net", "org", "edu", "gov", "io", "co", "uk", "jp", "de", "fr", "ru"],
+    "default": [
+      "com",
+      "cn",
+      "net",
+      "org",
+      "edu",
+      "gov",
+      "io",
+      "co",
+      "uk",
+      "jp",
+      "de",
+      "fr",
+      "ru"
+    ],
     "hint": "排除的邮箱域名后缀列表，当 @数字 后面紧跟 .后缀 时不触发 at 转换。可自行添加或删除"
   }
 }
