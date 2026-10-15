@@ -326,6 +326,66 @@ def test_stacking_with_other_patch():
     ProviderManager.get_model_client = original
 
 
+# ═══════════════════ 6.6 生产事故复现：acc slots 代理（2026-10-15 线上） ═══════════════════
+def test_acc_slotted_proxy():
+    """线上事故：acc 流式引擎把 client 换成 __slots__ 代理 ⇒ 旧版包装 setattr 炸
+    ⇒ get_default_llm 抛异常 ⇒ 框架报成 'Default LLM model not configured'，LLM 完全哑掉。
+    现在：穿透到内层真客户端上包；工厂任何异常都放行。"""
+    print("\n## 6.6) acc __slots__ 代理穿透（线上事故复现）")
+
+    class SlottedProxy:
+        """acc LLMClientProxy 同款形状：__slots__ + __getattr__ 透传 + __class__ 冒充。"""
+        __slots__ = ("_wrapped", "_engine_factory")
+        def __init__(self, wrapped):
+            object.__setattr__(self, "_wrapped", wrapped)
+            object.__setattr__(self, "_engine_factory", None)
+        def __getattr__(self, name):
+            return getattr(self._wrapped, name)
+        @property
+        def __class__(self):
+            return self._wrapped.__class__
+        async def chat(self, request, *a, **k):
+            return await self._wrapped.chat(request, *a, **k)
+
+    plug, r = mk()
+
+    class FakeClient:
+        async def chat(self, request, *a, **k):
+            return FakeResp('<msg><text>好</text></msg>\n<ops_config><domain>plugin</domain>'
+                            '<target>j</target><patch>{"a":1}</patch></ops_config>')
+
+    inner = FakeClient()
+    proxy = SlottedProxy(inner)
+    wrapped = r._wrap_client(proxy)
+    check("代理不被替换（返回同一对象）", wrapped is proxy)
+    check("内层真客户端被包装", getattr(inner, "_xtf_rescue_wrapped", False))
+    check("代理的 chat 仍是 acc 类方法（未被替换）",
+          type(proxy).__dict__["chat"] is not None)
+    resp = asyncio.run(proxy.chat("req"))   # 代理 chat → 内层（已包）→ 搭救生效
+    check("经代理的调用仍被搭救", bool(resp.tool_calls))
+    check("幂等：重复包装不双层", r._wrap_client(proxy) is proxy)
+
+    # 工厂级兜底：_wrap_client 炸了也要放行（get_default_llm 绝不能再被拖死）
+    class BoomRescue(ToolRescue):
+        def _wrap_client(self, client, _depth=0):
+            raise RuntimeError("boom")
+    plug2, r2 = mk()
+    r2._wrap_client = BoomRescue._wrap_client.__get__(r2)
+
+    pm_mod = types.ModuleType("core.provider.provider_manager")
+    class ProviderManager:
+        def get_model_client(self, provider_id, model_id, model_type=None):
+            return FakeClient()
+    pm_mod.ProviderManager = ProviderManager
+    pkg = types.ModuleType("core.provider"); pkg.__path__ = []
+    sys.modules["core.provider"] = pkg
+    sys.modules["core.provider.provider_manager"] = pm_mod
+    assert r2.install() is True
+    got = ProviderManager().get_model_client("p", "m")   # 不抛 + 返回原样
+    check("工厂兜底：包装炸了仍返回客户端", isinstance(got, FakeClient))
+    r2.uninstall()
+
+
 # ═══════════════════════════ 7. 故障隔离 ═══════════════════════════
 def test_failure_isolation():
     print("\n## 7) 故障隔离")
@@ -387,6 +447,7 @@ def main():
     test_dedup()
     test_patch_lifecycle()
     test_stacking_with_other_patch()
+    test_acc_slotted_proxy()
     test_failure_isolation()
     test_defaults_off()
     bad = [n for n, ok in RESULTS if not ok]
