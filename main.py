@@ -237,7 +237,6 @@ class XmlTagFixerPlugin(BasePlugin):
         # （不写长期记忆、不落历史存档 —— 下轮即消失，零污染）。
         self.rescue_feedback = cfg.get("rescue_feedback", False)
         self.rescue_deny = [str(x) for x in (cfg.get("rescue_deny") or [])]
-        self.rescue_explain_guard = cfg.get("rescue_explain_guard", True)
         self._rescue = None          # ToolRescue 实例（initialize 时创建）
         self._rescue_notes = []      # 待注入的当轮提示（下轮 on_llm_request 消费）
 

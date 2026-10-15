@@ -172,11 +172,5 @@
     "type": "list",
     "default": [],
     "hint": "永不搭救的工具名列表（一般不需要配，工具自己的权限层照常生效）"
-  },
-  "rescue_explain_guard": {
-    "name": "讲解语境豁免",
-    "type": "switch",
-    "default": true,
-    "hint": "块前有「示例/例如/写法/格式如下」等字样时判定为在讲解标签，不执行"
   }
 }

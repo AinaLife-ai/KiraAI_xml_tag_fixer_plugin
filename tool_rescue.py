@@ -53,9 +53,6 @@ _XML_PARAM = re.compile(r"<([a-zA-Z_]\w*)>(.*?)</\1>", re.S)
 # ── 保护区（绝不碰）────────────────────────────────────────────────────────
 _MSG_REGION = re.compile(r"<msg\b.*?</msg>|<msg\s*/>", re.S)
 _FENCE_REGION = re.compile(r"```.*?```", re.S)
-_EXPLAIN_HINT = re.compile(
-    r"(示例|例如|举例|写法|格式如下|像这样|介绍一下|讲解|example|e\.g\.|for instance)", re.I)
-
 
 def _protected_spans(text: str) -> list:
     spans = [ (m.start(), m.end()) for m in _MSG_REGION.finditer(text) ]
@@ -71,9 +68,6 @@ def _overlaps_protected(spans, s, e) -> bool:
     """剥除区间与保护区有交集 ⇒ 不可剥（病态嵌套时保 msg 内容不丢）。"""
     return any(s < b and e > a for a, b in spans)
 
-
-def _explain_context(text: str, start: int) -> bool:
-    return bool(_EXPLAIN_HINT.search(text[max(0, start - 120):start]))
 
 
 def _unescape(s: str) -> str:
@@ -282,9 +276,6 @@ class ToolRescue:
 
     def _eligible(self, name: str, args: Optional[dict], text: str, pos: int) -> bool:
         if args is None:
-            return False
-        if self.plugin.rescue_explain_guard and _explain_context(text, pos):
-            logger.info("[xml_tag_fixer] 疑似讲解语境，跳过搭救: %s", name)
             return False
         return self._validate_schema(name, args)
 
