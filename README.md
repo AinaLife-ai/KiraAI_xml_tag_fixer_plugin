@@ -1,4 +1,4 @@
-# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.5.1
+# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.5.2
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_xml_tag_fixer_plugin)
 
@@ -16,6 +16,17 @@
 
 <details>
 <summary><b>版本新增（点击展开）</b></summary>
+
+### 1.5.2 新增（工具调用搭救：DeepSeek 文本态工具调用 → 原生执行）
+
+- **新功能「工具调用搭救」**（`tool_tag_rescue`，默认开）：DeepSeek V4 系等模型在「XML 输出契约 + 原生工具通道」混合提示下，会把工具调用**写成文本**（自造 `<ops_config>…` 这类 XML 标签，或漏出内部 DSML 标记）——框架对未知顶层标签静默丢弃，调用永远不会发生，模型也收不到失败信号于是反复重犯。本功能在**响应边界**（模型客户端 chat 返回处、框架锁存 `has_tool_calls` 之前）把文本态调用翻译成标准 `tool_calls` 注入响应：执行、结果回灌、多步续跑、历史记账**全走框架原生路径**，模型完全无感，连环调用天然可用。
+- **三种形态全覆盖**：标准/变体 DSML 块、退化 DSML（缺包裹头/双管变体/裸 `<parameter>`，对应上游 vllm#48931/#51914 实锤泄漏）、纯 XML 化调用（内层转义与否都认、内层 JSON 也认）。
+- **不误伤矩阵**：已注册输出标签（含插件自定义根标签）永不碰；`<msg>` 内与代码围栏内的内容永不碰（讲解/示例场景）；块前有「示例/例如/写法」等讲解语境时不执行；本轮已有真实 tool_calls 时只剥泄漏残片、**绝不重复执行**；参数按工具 JSON schema 校验+类型归一，不合法不执行；同轮同参数幂等去重；剥除区间与保护区重叠时宁可留下也绝不误删消息内容。
+- **接管纪律**（与 acc 同款）：包装 `ProviderManager.get_model_client`（两代框架签名一致），在返回的模型客户端实例上包一层 `chat`；签名 `*args/**kwargs` 原样透传；幂等标记防双层；terminate 时仅当当前实现是本插件装的才还原；与 acc 等同类补丁实测可堆叠。
+- **反馈提示默认关**：`rescue_feedback` 开启后，下一轮给模型一条 `persist=False` 的当轮提示（不落长期记忆、不进历史存档，下轮即消失）。
+- 新增 `tests/test_tool_rescue.py`（33 项：三形态 × 误伤矩阵 × 防双执行 × schema × 幂等 × 接管生命周期 × 堆叠 × 故障隔离）；修复既有套件一个预存兼容性 bug（`Record()` 缺参）。
+- 实测：2.x / 3.0 GA 真框架端到端通过（加载→接管→翻译注入→剥净→卸载还原）；翻译开销 ~2ms/96KB 响应（纯内存，零新增 IO/await）。
+
 
 ### 1.5.1 修复
 

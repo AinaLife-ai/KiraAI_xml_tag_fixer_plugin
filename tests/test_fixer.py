@@ -412,7 +412,7 @@ def test_voice_split():
         print("  (跳过：本地无框架模块)")
         return
 
-    ch = MessageChain([At("1"), Record(), At("2")])
+    ch = MessageChain([At("1"), Record("http://example.com/x.mp3"), At("2")])
     r = [[type(e).__name__ for e in c.message_list]
          for c in XmlTagFixerPlugin._split_voice_chain(ch)]
     check("语音单独成链", sum(1 for g in r if g == ["Record"]) == 1, f"{r}")

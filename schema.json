@@ -142,5 +142,41 @@
       "ru"
     ],
     "hint": "排除的邮箱域名后缀列表，当 @数字 后面紧跟 .后缀 时不触发 at 转换。可自行添加或删除"
+  },
+  "tool_tag_rescue": {
+    "name": "工具调用搭救（DeepSeek 救星）",
+    "type": "switch",
+    "default": false,
+    "hint": "默认关闭。打开后：模型把工具调用写成文本（自造XML标签/DSML泄漏）时，自动翻译成框架原生 tool_calls 执行——执行/回灌/续跑全走框架原生路径，模型无感。已注册输出标签、msg内、代码围栏内、讲解语境一律不碰；本轮已有真调用时只剥残片不重复执行"
+  },
+  "rescue_dsml": {
+    "name": "搭救 DSML 泄漏",
+    "type": "switch",
+    "default": true,
+    "hint": "覆盖 <｜DSML｜invoke> 及退化形态（缺包裹头/双管变体/裸 parameter 标签），vllm #48931/#51914 实锤的上游泄漏"
+  },
+  "rescue_xml_tooltag": {
+    "name": "搭救 XML 化调用",
+    "type": "switch",
+    "default": true,
+    "hint": "覆盖模型自造的 <工具名><参数>…</参数></工具名> 写法（内层转义与否都认），如 <ops_config>"
+  },
+  "rescue_feedback": {
+    "name": "搭救提示反馈",
+    "type": "switch",
+    "default": false,
+    "hint": "搭救成功后，下一轮请求里给模型一条 persist=False 的当轮提示（不落长期记忆、不进历史存档，下轮即消失）。默认关闭=完全无感"
+  },
+  "rescue_deny": {
+    "name": "搭救黑名单",
+    "type": "list",
+    "default": [],
+    "hint": "永不搭救的工具名列表（一般不需要配，工具自己的权限层照常生效）"
+  },
+  "rescue_explain_guard": {
+    "name": "讲解语境豁免",
+    "type": "switch",
+    "default": true,
+    "hint": "块前有「示例/例如/写法/格式如下」等字样时判定为在讲解标签，不执行"
   }
 }

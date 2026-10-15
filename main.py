@@ -227,6 +227,20 @@ class XmlTagFixerPlugin(BasePlugin):
         self.force_wrap_tags -= self.IGNORE_TAGS
         self.force_wrap_tags -= self.no_wrap_tags
 
+        # ── 工具调用搭救（tool_rescue）─────────────────────────────────
+        # 模型把工具调用写成文本（自造 XML 标签 / DeepSeek DSML 泄漏）时，
+        # 在响应边界翻译成框架原生 tool_calls —— 执行/回灌/续跑全走框架原生路径。
+        self.tool_tag_rescue = cfg.get("tool_tag_rescue", False)  # 默认关：开箱零行为变化，想用再开
+        self.rescue_dsml = cfg.get("rescue_dsml", True)
+        self.rescue_xml_tooltag = cfg.get("rescue_xml_tooltag", True)
+        # 搭救成功后的提示记录：默认关；开启也只用 persist=False 的当轮提示
+        # （不写长期记忆、不落历史存档 —— 下轮即消失，零污染）。
+        self.rescue_feedback = cfg.get("rescue_feedback", False)
+        self.rescue_deny = [str(x) for x in (cfg.get("rescue_deny") or [])]
+        self.rescue_explain_guard = cfg.get("rescue_explain_guard", True)
+        self._rescue = None          # ToolRescue 实例（initialize 时创建）
+        self._rescue_notes = []      # 待注入的当轮提示（下轮 on_llm_request 消费）
+
         self._mimo_checked = False
 
     # ========== 标签定界符修复（双尖括号 / 反斜杠转义）==========
@@ -319,13 +333,22 @@ class XmlTagFixerPlugin(BasePlugin):
         return m.group(0) if m else ""
 
     async def initialize(self):
+        if self.tool_tag_rescue:
+            try:
+                from .tool_rescue import ToolRescue
+                self._rescue = ToolRescue(self)
+                self._rescue.install()
+            except Exception:
+                logger.exception("[xml_tag_fixer] 工具搭救安装失败（不影响修复主功能）")
+                self._rescue = None
         logger.info(f"XmlTagFixerPlugin initialized (mode={self.wrap_mode}, force_wrap={sorted(self.force_wrap_tags)}, "
                     f"only_final={self.only_final}, fix_msg={self.fix_missing_msg}, "
                     f"double_brackets={self.fix_double_brackets}, fix_at={self.fix_at_tag_format}, "
                     f"convert_at={self.convert_text_at_to_tag}, escape={self.escape_special_chars}, "
                     f"fallback={self.fallback_wrap_text}, no_wrap={sorted(self.no_wrap_tags)}, "
                     f"flatten={self.flatten_no_wrap_tags}, record_split={self.fix_record_split}, "
-                    f"split_blank={self.split_blank_line_messages}, stray={self.handle_stray_content})")
+                    f"split_blank={self.split_blank_line_messages}, stray={self.handle_stray_content}, "
+                    f"tool_rescue={self.tool_tag_rescue and self._rescue is not None})")
         self._run_config_migration()
         self._try_takeover_mimo()
 
@@ -369,6 +392,12 @@ class XmlTagFixerPlugin(BasePlugin):
             return None
 
     async def terminate(self):
+        if self._rescue is not None:
+            try:
+                self._rescue.uninstall()
+            except Exception:
+                logger.exception("[xml_tag_fixer] 工具搭救卸载异常")
+            self._rescue = None
         logger.info("XmlTagFixerPlugin terminated")
 
     @on.loaded()
@@ -435,6 +464,16 @@ class XmlTagFixerPlugin(BasePlugin):
     # 标签开口（判断未闭合尾巴用；属性懒惰匹配，避免吞掉自闭合的 /）
     _TAG_OPEN_RE = re.compile(r"<([a-zA-Z][\w-]*)(?:\s[^>]*?)?(/?)>")
 
+    def _note_rescued(self, calls: list) -> None:
+        """搭救成功的当轮提示（默认关；开启也只用 persist=False —— 不落长期记忆）。"""
+        if not self.rescue_feedback:
+            return
+        names = ", ".join(c["name"] for c in calls)
+        self._rescue_notes.append(
+            f"<system_reminder>上一轮你把工具调用写成了消息文本（XML/DSML 标签），"
+            f"系统已代为翻译执行：{names}。建议优先使用原生工具调用通道。"
+            f"</system_reminder>")
+
     @on.llm_request()
     async def cache_registered_tags(self, event, req, tag_set, *_):
         """缓存本次请求 tag_set 的已注册标签名，供杂散内容按身份分流。
@@ -447,6 +486,18 @@ class XmlTagFixerPlugin(BasePlugin):
             self._registered_root_tags = {t.name for t in tag_set.get_all_root()}
         except Exception:
             pass
+        # 搭救反馈提示（persist=False：只活在当轮请求里，不写记忆/历史）
+        if self._rescue_notes:
+            try:
+                from core.prompt_manager import Prompt
+                notes, self._rescue_notes = self._rescue_notes, []
+                for note in notes:
+                    req.system_prompt.append(Prompt(
+                        content=note, name="tool_rescue_note",
+                        source="system", persist=False))
+            except Exception:
+                self._rescue_notes = []
+                logger.debug("[xml_tag_fixer] 搭救提示注入失败（忽略）", exc_info=True)
 
     @staticmethod
     def _inside_msg(prefix: str) -> bool:
