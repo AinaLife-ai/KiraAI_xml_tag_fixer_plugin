@@ -67,13 +67,12 @@ COUNT_SCHEMA = {"type": "object", "properties": {"n": {"type": "integer"}}, "req
 
 class FakePlugin:
     """只带 tool_rescue 需要的属性面。"""
-    def __init__(self, tools=(), msg_tags=(), root_tags=(), deny=(), explain_guard=True,
+    def __init__(self, tools=(), msg_tags=(), root_tags=(), deny=(),
                  dsml=True, xmltool=True, feedback=False):
         self.ctx = types.SimpleNamespace(tool_mgr=types.SimpleNamespace(tool_set=FakeToolSet(tools)))
         self._registered_msg_tags = set(msg_tags)
         self._registered_root_tags = set(root_tags)
         self.rescue_deny = list(deny)
-        self.rescue_explain_guard = explain_guard
         self.rescue_dsml = dsml
         self.rescue_xml_tooltag = xmltool
         self.rescue_feedback = feedback
@@ -162,17 +161,15 @@ def test_false_positives():
     resp = FakeResp(t2)
     check("围栏内原样保留", r.translate(resp) is False and "<ops_config>" in resp.text_response)
 
-    # 讲解语境（块前有"示例"）⇒ 不碰
-    t3 = '<msg><text>嗯</text></msg>\n示例写法如下：\n<ops_config><domain>plugin</domain></ops_config>'
+    # 讲解语境豁免已整体移除（词网漏且误拦真调用）——裸文本讲解会正常执行（既定残余风险）；
+    # msg 内讲解永远安全（主防线，不依赖关键词）。
+    t3 = ('<msg><text>嗯</text></msg>\n示例写法如下：\n'
+          '<ops_config><domain>plugin</domain><target>jmdown</target><patch>{"a": 1}</patch></ops_config>')
     resp = FakeResp(t3)
-    check("讲解语境豁免", r.translate(resp) is False)
-    # 关掉豁免 ⇒ 救（参数要给全，否则 schema 校验照样拦）
-    plug2, r2 = mk(explain_guard=False)
-    t3_full = ('<msg><text>嗯</text></msg>\n示例写法如下：\n'
-               '<ops_config><domain>plugin</domain><target>jmdown</target>'
-               '<patch>{"a": 1}</patch></ops_config>')
-    resp3 = FakeResp(t3_full)
-    check("关掉豁免后正常搭救", r2.translate(resp3) is True)
+    check("裸文本讲解也执行（豁免移除后的既定行为）", r.translate(resp) is True)
+    t3m = ('<msg><text>改配置要这样写：<ops_config><domain>plugin</domain><target>j</target>'
+           '<patch>{"a":1}</patch></ops_config></text></msg>')
+    check("msg 内讲解不执行（主防线天然成立）", r.translate(FakeResp(t3m)) is False)
 
     # 注册标签名撞车（插件注册的根标签 mimo_tts）⇒ 永不碰
     plug4, r4 = mk(tools=(FakeTool("mimo_tts", {"type": "object", "properties": {}}),),

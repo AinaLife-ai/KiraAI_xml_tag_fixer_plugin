@@ -1,4 +1,4 @@
-# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.5.2
+# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.5.3
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_xml_tag_fixer_plugin)
 
@@ -16,6 +16,12 @@
 
 <details>
 <summary><b>版本新增（点击展开）</b></summary>
+
+### 1.5.3 修正（manifest 标签 + 移除讲解语境豁免）
+
+- **manifest 补 `tags`**：`必安`、`不安后悔`、`xml`、`tag-fixer`、`tool-rescue`、`dsml`、`llm-output`。
+- **讲解语境豁免（`rescue_explain_guard`）整体移除**（配置项一并删除，用户无从误开）：实测关键词网拦不住自然讲解（「改配置要这样写：…」不含「示例/写法」字样照样被执行），还可能误拦真实调用（真调用前凑巧出现「示例」字样会哑火）；而规范的讲解本来就在 `<msg>` 内 —— msg 内豁免是天然主防线，不依赖关键词。移除后：真实调用全救；裸文本中的工具形讲解会被执行（可接受的残余风险）。
+- 版本 1.5.2 → 1.5.3
 
 ### 1.5.2 新增（工具调用搭救：DeepSeek 文本态工具调用 → 原生执行）
 
