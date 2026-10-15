@@ -1,4 +1,4 @@
-# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.5.3
+# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.5.4
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_xml_tag_fixer_plugin)
 
@@ -16,6 +16,21 @@
 
 <details>
 <summary><b>版本新增（点击展开）</b></summary>
+
+### 1.5.4 热修（开启工具搭救后 LLM 完全哑掉的线上事故）
+
+- **根因**：acc 的流式引擎会把模型客户端换成 `LLMClientProxy`（**`__slots__` 类**），
+  搭救层往代理实例上 `setattr` 包 `chat` ⇒ `AttributeError` ⇒ 异常一路传到
+  `get_default_llm()` ⇒ 框架的兜底把**任何异常**都报成
+  "Default LLM model not configured" ⇒ **LLM 完全无法回复**。
+- **修复**：
+  1. **代理穿透**：setattr 失败时穿到代理包着的**内层真客户端**上包（`_wrapped`），
+     且**返回外层代理**——acc 的流式引擎照跑、搭救经由 `proxy.chat → wrapped.chat` 依然命中，
+     两家共存互不旁路；
+  2. **工厂级兜底**：包装过程的任何异常都放行原客户端——**搭救失败绝不拖垮模型解析**。
+- 测试：新增 `test_acc_slotted_proxy`（线上事故复现：acc 同款 slots 代理形状）+
+  用 acc 的**真实 `LLMClientProxy` 类**端到端复现验证（旧版必炸 → 新版共存）。
+- 版本 1.5.3 → 1.5.4
 
 ### 1.5.3 修正（manifest 标签 + 移除讲解语境豁免）
 

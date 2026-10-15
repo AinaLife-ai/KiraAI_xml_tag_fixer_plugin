@@ -107,7 +107,13 @@ class ToolRescue:
 
         def patched_get_model_client(p_self, *args, **kwargs):
             client = original(p_self, *args, **kwargs)
-            return mgr._wrap_client(client)
+            try:
+                return mgr._wrap_client(client)
+            except Exception:
+                # 铁律：搭救失败绝不拖垮模型解析（调用方把任何异常都报成
+                # "Default LLM model not configured"，会把排查方向带偏）
+                logger.exception("[xml_tag_fixer] 客户端包装失败，按未包装放行")
+                return client
 
         patched_get_model_client._xtf_rescue_original = original
         setattr(patched_get_model_client, self._MARK, True)
@@ -125,12 +131,23 @@ class ToolRescue:
         self._patched_cls = None
         self._installed = False
 
-    def _wrap_client(self, client):
-        """在模型客户端实例上包 chat（实例级，仿框架 _guard_model_call）。"""
-        if client is None or getattr(client, "_xtf_rescue_wrapped", False):
+    def _wrap_client(self, client, _depth: int = 0):
+        """在模型客户端实例上包 chat（实例级，仿框架 _guard_model_call）。
+
+        代理穿透：acc 的流式引擎会把 client 换成 `LLMClientProxy`
+        （`__slots__` 类 ⇒ 实例上不能 setattr）——穿到它包的真客户端上包；
+        真客户端的实例属性遮蔽其类方法，代理的 `chat` 里调 `wrapped.chat`
+        依然会命中我们的包装 ⇒ 搭救与流式引擎两不误。
+        包不了就原样放行（宁可不搭救，绝不可让模型解析报错）。
+        """
+        if client is None or _depth > 2:
             return client
         chat = getattr(client, "chat", None)
         if not callable(chat):
+            return client
+        inner = getattr(client, "_wrapped", None)
+        if getattr(client, "_xtf_rescue_wrapped", False) or \
+                (inner is not None and getattr(inner, "_xtf_rescue_wrapped", False)):
             return client
         original = chat  # 已是绑定方法
         mgr = self
@@ -144,8 +161,18 @@ class ToolRescue:
                 logger.exception("[xml_tag_fixer] 工具搭救翻译异常（已忽略，原样放行）")
             return resp
 
-        client.chat = chat_rescued
-        client._xtf_rescue_wrapped = True
+        try:
+            client.chat = chat_rescued
+            client._xtf_rescue_wrapped = True
+        except (AttributeError, TypeError):
+            # __slots__ / 代理对象 ⇒ 穿到内层真客户端上包，但**返回外层对象**
+            # （外层可能是 acc 的流式代理 —— 返回内层会把人家的引擎旁路掉）。
+            if inner is not None:
+                self._wrap_client(inner, _depth + 1)
+                return client
+            logger.debug("[xml_tag_fixer] 客户端不可实例包装（%s），跳过搭救",
+                         type(client).__name__)
+            return client
         return client
 
     # ───────────────────────────── 翻译主入口 ─────────────────────────────
