@@ -237,6 +237,9 @@ class XmlTagFixerPlugin(BasePlugin):
         # （不写长期记忆、不落历史存档 —— 下轮即消失，零污染）。
         self.rescue_feedback = cfg.get("rescue_feedback", False)
         self.rescue_deny = [str(x) for x in (cfg.get("rescue_deny") or [])]
+        # 工具调用碎片清理（invoke/parameter/calls 闭合符与 DSML 标记，裸/转义形态）。
+        # 消息卫生项，与搭救开关独立：模型退化 flood 时几百条残片会让消息变垃圾场。
+        self.strip_tool_debris = cfg.get("strip_tool_debris", True)
         self._rescue = None          # ToolRescue 实例（initialize 时创建）
         self._rescue_notes = []      # 待注入的当轮提示（下轮 on_llm_request 消费）
 
@@ -1385,8 +1388,26 @@ class XmlTagFixerPlugin(BasePlugin):
                 logger.debug(f"解析单个 msg 失败: {e}")
                 return self._fallback_wrap(original)
 
+    def _known_tool_names(self) -> set:
+        """当前注册工具名 − 注册标签名（撞名时按标签保护优先，绝不剥）。"""
+        names = set()
+        try:
+            tm = getattr(self.ctx, "tool_mgr", None)
+            ts = getattr(tm, "tool_set", None)
+            tools = getattr(ts, "tools", None) or []
+            names = {getattr(t, "name", None) for t in tools} - {None}
+        except Exception:
+            pass
+        return names - set(self._registered_msg_tags) - set(self._registered_root_tags)
+
     def fix_xml(self, xml_str: str) -> str:
         """入口：反斜杠形态有歧义时跑两条路径，选更能保住消息的那条。"""
+        if self.strip_tool_debris:
+            try:
+                from .tool_rescue import strip_tool_debris
+                xml_str = strip_tool_debris(xml_str, known_tools=self._known_tool_names())
+            except Exception:
+                logger.exception("[xml_tag_fixer] 工具碎片清理异常（忽略，继续后续修复）")
         xml_str = self._escape_code_fences(xml_str)
         if self.fix_backslash_tags and _BACKSLASH_TAG_RE.search(xml_str):
             restored_raw = self._apply_backslash_tags(xml_str)

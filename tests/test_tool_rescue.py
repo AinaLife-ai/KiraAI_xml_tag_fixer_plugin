@@ -82,6 +82,8 @@ class FakePlugin:
             self._rescue_notes.append(", ".join(c["name"] for c in calls))
 
 
+TREQ = types.SimpleNamespace(tools=[{"type": "function"}], tool_set=None)  # 带工具的请求（agent 循环形态）
+
 class FakeResp:
     def __init__(self, text, tool_calls=None):
         self.text_response = text
@@ -267,14 +269,14 @@ def test_patch_lifecycle():
     pm = ProviderManager()
     client = pm.get_model_client("p", "m")
     check("工厂包装生效", getattr(client, "_xtf_rescue_wrapped", False) is True)
-    resp = asyncio.run(client.chat("req", extra="透传"))
+    resp = asyncio.run(client.chat(TREQ, extra="透传"))
     check("chat 包装后注入 tool_calls", bool(resp.tool_calls))
     check("额外 kwargs 原样透传", calls[0][2] == {"extra": "透传"})
     # 幂等：再装一次不双层包
     r2 = ToolRescue(plug)
     assert r2.install() is True
     client2 = pm.get_model_client("p", "m")
-    asyncio.run(client2.chat("req"))
+    asyncio.run(client2.chat(TREQ))
     check("重复安装不产生双层包装", getattr(client2.chat, "_xtf_rescue_original", None) is None
           or True)  # 认领路径不新增层
     # 卸载还原
@@ -317,7 +319,7 @@ def test_stacking_with_other_patch():
     assert r.install() is True
     client = ProviderManager().get_model_client("p", "m")
     check("叠层后 acc 层仍被调用", calls == ["acc"])
-    resp = asyncio.run(client.chat("req"))
+    resp = asyncio.run(client.chat(TREQ))
     check("叠层后搭救仍生效", bool(resp.tool_calls))
     # 我们卸载 ⇒ acc 层应完好留下（不乱拆别人的层）
     r.uninstall()
@@ -361,7 +363,7 @@ def test_acc_slotted_proxy():
     check("内层真客户端被包装", getattr(inner, "_xtf_rescue_wrapped", False))
     check("代理的 chat 仍是 acc 类方法（未被替换）",
           type(proxy).__dict__["chat"] is not None)
-    resp = asyncio.run(proxy.chat("req"))   # 代理 chat → 内层（已包）→ 搭救生效
+    resp = asyncio.run(proxy.chat(TREQ))   # 代理 chat → 内层（已包）→ 搭救生效
     check("经代理的调用仍被搭救", bool(resp.tool_calls))
     check("幂等：重复包装不双层", r._wrap_client(proxy) is proxy)
 
@@ -495,6 +497,118 @@ def main():
     q6 = '<msg><text>要这样写：<qzone_publish text="示例"></qzone_publish></text></msg>'
     resp_q6 = FakeResp(q6)
     check("msg 内属性形态讲解不碰", r_q.translate(resp_q6) is False)
+
+
+    # —— 2026-10-16 flood 形态（生产实拍：几百条闭合残片刷屏）——
+    print("\n## 8.6) flood 与裸 invoke（生产实拍）")
+    from tool_rescue import strip_tool_debris
+
+    flood_esc = "&lt;/invoke&gt;\n&lt;/parameter&gt;\n" * 200
+    check("转义 flood 剥净", strip_tool_debris(flood_esc).strip() == "")
+    flood_bare = "</invoke>\n</parameter>\n" * 200
+    check("裸 flood 剥净", strip_tool_debris(flood_bare).strip() == "")
+
+    t_inv = ('<msg><text>好</text></msg>\n<invoke name="exec">\n'
+             '<parameter name="cmd">ls -la</parameter>\n</invoke>')
+    resp_inv = FakeResp(t_inv)
+    plug_e, r_e = mk()  # exec 在默认假工具集里
+    ok_inv = r_e.translate(resp_inv)
+    check("裸 invoke（无 DSML 前缀）搭救", ok_inv and
+          json.loads(resp_inv.tool_calls[0]["function"]["arguments"])["cmd"] == "ls -la")
+
+    t_mix = ('<msg><text>干</text></msg>\n<invoke name="exec">\n'
+             '<parameter name="cmd">ls</parameter>\n</invoke>\n' + "</invoke>\n</parameter>\n" * 50)
+    resp_mix = FakeResp(t_mix)
+    ok_mix = r_e.translate(resp_mix)
+    check("flood 中真调用救出", ok_mix and bool(resp_mix.tool_calls))
+    check("flood 剥净只剩 msg", "invoke" not in resp_mix.text_response
+          and "parameter" not in resp_mix.text_response)
+
+    check("msg 内闭合符字样不碰", strip_tool_debris(
+        '<msg><text>教程里 </parameter> 这样写</text></msg>') == '<msg><text>教程里 </parameter> 这样写</text></msg>')
+    check("围栏内 flood 不碰", "</invoke>" in strip_tool_debris('```\n</invoke>\n```'))
+    check("正常消息零变化", strip_tool_debris('<msg><text>正常</text></msg>') == '<msg><text>正常</text></msg>')
+
+    # fix_xml 层（搭救关、碎片清理开）也清理 flood
+    sys.path.insert(0, str(ROOT))
+    import main as main_mod
+    inst = main_mod.XmlTagFixerPlugin(None, {"enabled": True, "tool_tag_rescue": False,
+                                             "strip_tool_debris": True})
+    out = inst.fix_xml('<msg><text>好</text></msg>\n' + "</invoke>\n" * 30)
+    check("搭救关时 fix_xml 仍清 flood", "</invoke>" not in out)
+
+
+    # —— 终轮：历史只留正确的 + tag 表接线 ——
+    print("\n## 8.7) 历史只留正确的（失败调用块也清）+ tag 表兜底")
+
+    # ① 形态 C 不可搭救（缺 required）⇒ 块也从文本剥掉（不进历史）
+    plug87, r87 = mk()
+    t_bad = ('<msg><text>好</text></msg>\n'
+             '<ops_config><domain>plugin</domain></ops_config>')  # 缺 target/patch
+    resp_bad = FakeResp(t_bad)
+    ok_bad = r87.translate(resp_bad)
+    check("参数不合的已知工具块：不执行", ok_bad is False and not resp_bad.tool_calls)
+    check("参数不合的已知工具块：也从文本剥掉", "ops_config" not in resp_bad.text_response)
+
+    # ② 未知工具名的块 ⇒ 原样保留（可能是字面内容）
+    t_unk = '<msg><text>好</text></msg>\n<not_a_tool><x>1</x></not_a_tool>'
+    resp_unk = FakeResp(t_unk)
+    check("未知名字块原样保留", r87.translate(resp_unk) is False
+          and "<not_a_tool>" in resp_unk.text_response)
+
+    # ③ tag 表全局兜底：插件缓存为空时也能认出注册标签
+    plug3, r3 = mk()
+    plug3._registered_msg_tags = set()   # 缓存清空
+    plug3._registered_root_tags = set()
+    import types as _t
+    _ct = _t.ModuleType("core.tag")
+    class _FakeTag:
+        def __init__(self, name): self.name = name
+    class _FakeTagSet:
+        def __init__(self): self._all = []; self._root = []
+        def register(self, t): self._all.append(t)
+        def get(self, name=None): return next((t for t in self._all if t.name == name), None)
+        def get_root(self, name=None): return next((t for t in self._root if t.name == name), None)
+    _ct.tag_registry = _FakeTagSet()
+    sys.modules["core.tag"] = _ct
+    _ct.tag_registry.register(_FakeTag("mimo_tts"))
+    t_tag = '<msg><text>好</text></msg>\n<mimo_tts text="hi"></mimo_tts>'
+    resp_tag = FakeResp(t_tag)
+    check("缓存空时走全局注册表：注册标签不剥", r3.translate(resp_tag) is False
+          and "<mimo_tts" in resp_tag.text_response)
+
+    # ④ strip_tool_debris(known_tools=...)：搭救关时也剥工具形状块（含转义形态）
+    from tool_rescue import strip_tool_debris as _sd
+    out1 = _sd('<msg><text>好</text></msg>\n<ops_config><domain>x</domain></ops_config>',
+               known_tools={"ops_config"})
+    check("搭救关 hygiene：已知工具裸块剥掉", "ops_config" not in out1)
+    out2 = _sd('<msg><text>好</text></msg>\n&lt;ops_config&gt;x&lt;/ops_config&gt;',
+               known_tools={"ops_config"})
+    check("搭救关 hygiene：转义工具块剥掉", "ops_config" not in out2)
+    out3 = _sd('<msg><text>好</text></msg>\n<literal_tag>内容</literal_tag>',
+               known_tools={"ops_config"})
+    check("未知名字块保留", "<literal_tag>" in out3)
+
+
+    # —— 8.8) 请求级闸门（跨插件直调保护）——
+    print("\n## 8.8) 请求级闸门：没给工具的调用不翻译（直调保护）")
+    plug88, r88 = mk()
+
+    class ToolyClient:
+        async def chat(self, request, *a, **k):
+            return FakeResp('<msg><text>结论</text></msg>\n<ops_config><domain>plugin</domain>'
+                            '<target>j</target><patch>{"a":1}</patch></ops_config>')
+
+    # 没带工具的请求（直调：摘要/决策类插件的场景）
+    c1 = r88._wrap_client(ToolyClient())
+    resp88 = asyncio.run(c1.chat(types.SimpleNamespace(tools=None, tool_set=None)))
+    check("无工具请求：不翻译不剥块（直调内容不丢）",
+          not resp88.tool_calls and "<ops_config>" in resp88.text_response)
+
+    # 带工具的请求（agent 循环/subagent 的场景）
+    resp89 = asyncio.run(c1.chat(types.SimpleNamespace(tools=[{"type":"function"}], tool_set=None)))
+    check("带工具请求：正常翻译搭救", bool(resp89.tool_calls))
+    check("带工具请求：文本剥净", "ops_config" not in resp89.text_response)
 
     bad = [n for n, ok in RESULTS if not ok]
     print("\n" + "=" * 70)

@@ -172,5 +172,11 @@
     "type": "list",
     "default": [],
     "hint": "永不搭救的工具名列表（一般不需要配，工具自己的权限层照常生效）"
+  },
+  "strip_tool_debris": {
+    "name": "清理工具调用碎片",
+    "type": "switch",
+    "default": true,
+    "hint": "剥除模型退化泄漏的 invoke/parameter/calls 闭合残片与 DSML 标记（裸/转义形态），只剥不执行；msg 与代码围栏内不碰。与「工具调用搭救」开关互相独立"
   }
 }

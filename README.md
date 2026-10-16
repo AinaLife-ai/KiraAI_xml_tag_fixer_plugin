@@ -1,4 +1,4 @@
-# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.5.5
+# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.5.6
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_xml_tag_fixer_plugin)
 
@@ -16,6 +16,24 @@
 
 <details>
 <summary><b>版本新增（点击展开）</b></summary>
+
+### 1.5.6 新增（工具碎片清理 + 裸 invoke 形态搭救）
+
+- **生产实拍 flood**：模型退化刷出几百条 `</invoke>` / `</parameter>` 闭合残片（转义/裸两种形态，
+  控制台整屏刷屏）。新增 `strip_tool_debris`（**默认开**，与搭救开关独立）：只剥不执行，
+  msg 与代码围栏内不碰；flood 剥到零残留。
+- **裸 `<invoke name="x">` 无 DSML 前缀**（退化到家的形态）现在也识别搭救；
+  不可搭救的 invoke 块（工具不存在/参数不合法）按碎片整块剥除，孤立头只剥头不误删正文。
+- **历史只留正确的**：已注册工具的形状块「救不救都剥掉」（救=已原生执行；没救=失败尝试，
+  留在历史里只会喂养自模仿退化循环）；未知名字的块原样保留（可能是字面内容）。
+- **注册标签判定双保险**：on_llm_request 缓存的本请求 tag_set 名单 + 全局 `tag_registry`
+  实时兜底（缓存未建立时也安全）——注册标签永不误碰。
+- **请求级闸门（跨插件直调保护）**：这次调用没给模型工具（`request.tools`/`tool_set` 为空）
+  ⇒ 不是调用尝试 ⇒ 不翻译不剥块 —— 摘要/决策类插件（session_merger、记忆Z、Notes 等）
+  直调 LLM 的内容绝不受影响；agent 循环与 subagent 子代理（都带工具）正常搭救。
+- 测试：`test_tool_rescue.py` 68 项全绿（含 flood 实拍形态 + 搭救关时 fix_xml 仍清碎片 +
+  失败块剥离 + tag 表兜底 + 请求级闸门）。
+- 版本 1.5.5 → 1.5.6
 
 ### 1.5.5 新增（工具搭救覆盖属性参数形态）
 
