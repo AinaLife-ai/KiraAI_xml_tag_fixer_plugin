@@ -450,6 +450,52 @@ def main():
     test_acc_slotted_proxy()
     test_failure_isolation()
     test_defaults_off()
+    # —— 2026-10-16 生产实拍补充形态（qzone_publish）——
+    print("\n## 8.5) 实拍补充：属性参数 / 自闭合 / 转义内层（qzone_publish 原文）")
+
+    class QzoneToolSet:
+        def __contains__(self, n): return n == "qzone_publish"
+        def get(self, n):
+            return type("T", (), {"get_schema": lambda s: {"parameters": {"type": "object", "properties": {
+                "text": {"type": "string"}, "images": {"type": "array"},
+                "want_images": {"type": "boolean"}}, "required": ["text"]}}})()
+
+    plug_q, r_q = mk(tools=())
+    plug_q.ctx.tool_mgr.tool_set = QzoneToolSet()
+
+    q1 = ('<msg message_id="975407664">\n<text>这次走真通道（）</text>\n</msg>\n'
+          '<qzone_publish>\n&lt;text&gt;帮别人家bot搞图标搞了半天，我自己这个修女袖章倒是没人看（）&lt;/text&gt;\n</qzone_publish>')
+    resp_q1 = FakeResp(q1)
+    check("实拍第一轮（转义内层参数标签）搭救", r_q.translate(resp_q1) is True
+          and json.loads(resp_q1.tool_calls[0]["function"]["arguments"])["text"].startswith("帮别人家bot"))
+
+    q2 = ('<msg message_id="52709549">\n<text>这回真来（）</text>\n</msg>\n'
+          '<qzone_publish text="帮别人家bot搞图标搞了半天，我自己这个修女袖章倒是没人看（）">\n</qzone_publish>')
+    resp_q2 = FakeResp(q2)
+    check("实拍第二轮（属性参数）搭救", r_q.translate(resp_q2) is True
+          and json.loads(resp_q2.tool_calls[0]["function"]["arguments"])["text"].startswith("帮别人家bot"))
+
+    q3 = '<msg><text>发</text></msg>\n<qzone_publish text="纯文字一条"/>'
+    resp_q3 = FakeResp(q3)
+    check("自闭合+属性搭救", r_q.translate(resp_q3) is True
+          and json.loads(resp_q3.tool_calls[0]["function"]["arguments"])["text"] == "纯文字一条")
+
+    q4 = """<msg><text>发</text></msg>\n<qzone_publish text='看图' images='["http://a.jpg"]'></qzone_publish>"""
+    resp_q4 = FakeResp(q4)
+    ok4 = r_q.translate(resp_q4)
+    args4 = json.loads(resp_q4.tool_calls[0]["function"]["arguments"]) if resp_q4.tool_calls else {}
+    check("单引号属性+JSON数组归一", ok4 is True and args4.get("images") == ["http://a.jpg"])
+
+    q5 = '<msg><text>发</text></msg>\n<qzone_publish text="看图" images="[&quot;http://a.jpg&quot;]"></qzone_publish>'
+    resp_q5 = FakeResp(q5)
+    ok5 = r_q.translate(resp_q5)
+    args5 = json.loads(resp_q5.tool_calls[0]["function"]["arguments"]) if resp_q5.tool_calls else {}
+    check("双引号属性+&quot;转义JSON数组", ok5 is True and args5.get("images") == ["http://a.jpg"])
+
+    q6 = '<msg><text>要这样写：<qzone_publish text="示例"></qzone_publish></text></msg>'
+    resp_q6 = FakeResp(q6)
+    check("msg 内属性形态讲解不碰", r_q.translate(resp_q6) is False)
+
     bad = [n for n, ok in RESULTS if not ok]
     print("\n" + "=" * 70)
     print(f"总计 {len(RESULTS)} 项，失败 {len(bad)}")

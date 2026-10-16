@@ -1,4 +1,4 @@
-# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.5.4
+# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.5.5
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_xml_tag_fixer_plugin)
 
@@ -16,6 +16,15 @@
 
 <details>
 <summary><b>版本新增（点击展开）</b></summary>
+
+### 1.5.5 新增（工具搭救覆盖属性参数形态）
+
+- **生产实拍缺口**：模型把参数写进**标签属性**（`<qzone_publish text="…">`）时旧版不识别 ⇒ 不搭救。
+  现支持：属性参数（双引号/单引号/规范 `&quot;` 转义全认）、自闭合 `<tool …/>`、属性与内层子标签混用；
+  属性值按工具 schema 归一（数组/对象形态自动 JSON 解析）。
+- 转义内层参数标签（`<tool>&lt;text&gt;…&lt;/text&gt;</tool>`）原有支持不变，补进常驻回归。
+- 测试：`test_tool_rescue.py` 49 项全绿（含两张生产实拍原文逐字回放）。
+- 版本 1.5.4 → 1.5.5
 
 ### 1.5.4 热修（开启工具搭救后 LLM 完全哑掉的线上事故）
 

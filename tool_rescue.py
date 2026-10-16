@@ -47,8 +47,13 @@ _DSML_PARAM = re.compile(
 _DEGEN_HEAD = re.compile(r"<([a-zA-Z_][\w-]*)[\"']?\s*>")
 
 # ── 纯 XML 化调用：<toolname>…</toolname>（顶层、msg 外）──────────────────────
-_XML_TOOL = re.compile(r"<([a-zA-Z_]\w*)>(.*?)</\1>", re.S)
+# <tool …>inner</tool> 或自闭合 <tool …/>：属性与内层都可能是参数载体
+_XML_TOOL = re.compile(
+    r"<(?P<name>[a-zA-Z_]\w*)(?P<attrs>(?:\s+[\w-]+(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'))?)*)\s*(?:/>|>(?P<inner>.*?)</(?P=name)>)",
+    re.S)
 _XML_PARAM = re.compile(r"<([a-zA-Z_]\w*)>(.*?)</\1>", re.S)
+# 属性参数：name="value" 或 name='value'（值经 unescape + JSON 归一）
+_XML_ATTR = re.compile(r"""([a-zA-Z_][\w-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 
 # ── 保护区（绝不碰）────────────────────────────────────────────────────────
 _MSG_REGION = re.compile(r"<msg\b.*?</msg>|<msg\s*/>", re.S)
@@ -251,10 +256,10 @@ class ToolRescue:
             for m in _XML_TOOL.finditer(text):
                 if _in_protected(spans, m.start(), m.end()):
                     continue
-                name = m.group(1)
+                name = m.group("name")
                 if not self._tool_known(name) or self._tag_known(name):
                     continue
-                args = self._parse_xml_params(m.group(2))
+                args = self._parse_xml_params(m.group("inner") or "", m.group("attrs") or "")
                 if args is None:
                     continue
                 if self._eligible(name, args, text, m.start()):
@@ -370,25 +375,34 @@ class ToolRescue:
             args[pm.group(1)] = _jsonish(val)
         return args
 
-    def _parse_xml_params(self, inner: str) -> Optional[dict]:
-        inner = inner.strip()
+    def _parse_xml_params(self, inner: str, attrs: str = "") -> Optional[dict]:
+        args: dict = {}
+        # 属性形态：<qzone_publish text="…">（模型把参数写进属性，第二轮实拍形态）
+        if attrs:
+            for am in _XML_ATTR.finditer(attrs):
+                args[am.group(1)] = _jsonish(_unescape(am.group(2) if am.group(2) is not None else am.group(3) or ""))
+        inner = (inner or "").strip()
         if not inner:
-            return {}
+            return args
         # JSON 形态：<ops_config>{"domain": ...}</ops_config>
         if inner.startswith("{"):
             try:
                 obj = json.loads(_unescape(inner))
-                return obj if isinstance(obj, dict) else None
+                if not isinstance(obj, dict):
+                    return None
+                args.update(obj)
+                return args
             except Exception:
                 return None
         # 子标签形态（可能整体被转义过）
         src = _unescape(inner) if "&lt;" in inner else inner
-        args = {}
         found = False
         for pm in _XML_PARAM.finditer(src):
             args[pm.group(1)] = _jsonish(pm.group(2).strip())
             found = True
-        return args if found else None
+        if not found and not args:
+            return None
+        return args
 
 
 class _Skip: ...
