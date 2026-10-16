@@ -37,7 +37,7 @@ _P = r"[|｜]+"
 _DSML_ANY = re.compile(rf"</?{_P}DSML{_P}", re.I)
 # 标准 invoke：<｜DSML｜invoke name="X">…</｜DSML｜invoke>（闭合符可退化）
 _DSML_INVOKE = re.compile(
-    rf"<{_P}DSML{_P}invoke\s+name=\"([^\"]+)\"[^>]*>(.*?)(?:</{_P}DSML{_P}\s*invoke\s*>|</{_P}DSML{_P}calls\s*>|$)",
+    rf"<(?:{_P}DSML{_P})?invoke\s+name=\"([^\"]+)\"[^>]*>(.*?)(?:</(?:{_P}DSML{_P}\s*)?invoke\s*>|</(?:{_P}DSML{_P}\s*)?calls\s*>|$)",
     re.S)
 # 参数：<｜DSML｜parameter name="k">v</…> 或退化裸 <parameter name="k">v</…>
 _DSML_PARAM = re.compile(
@@ -55,6 +55,18 @@ _XML_PARAM = re.compile(r"<([a-zA-Z_]\w*)>(.*?)</\1>", re.S)
 # 属性参数：name="value" 或 name='value'（值经 unescape + JSON 归一）
 _XML_ATTR = re.compile(r"""([a-zA-Z_][\w-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 
+# 工具调用碎片（永远不可能是正文内容）：闭合符/标记，裸或实体转义形态。
+# 用于"只剥不执行"的兜底清理（比如模型退化刷出几百条 </invoke> 的 flood）。
+_DEBRIS_NAMES = r"(?:invoke|parameter|tool_calls|calls|function_calls|functions)"
+_TOOL_DEBRIS = re.compile(
+    # 整行形态（连行尾换行一起吃，flood 剥完不留几百个空行）
+    rf"^[ \t]*(?:</{_DEBRIS_NAMES}\s*>|&lt;/{_DEBRIS_NAMES}\s*&gt;)[ \t]*\n?"
+    # 行内形态
+    rf"|(?:</{_DEBRIS_NAMES}\s*>|&lt;/{_DEBRIS_NAMES}\s*&gt;)",
+    re.M)
+# 转义形态的工具块（&lt;toolname&gt;…&lt;/toolname&gt;）
+_XML_TOOL_ESC = re.compile(r"&lt;([a-zA-Z_]\w*)&gt;.*?&lt;/\1&gt;", re.S)
+
 # ── 保护区（绝不碰）────────────────────────────────────────────────────────
 _MSG_REGION = re.compile(r"<msg\b.*?</msg>|<msg\s*/>", re.S)
 _FENCE_REGION = re.compile(r"```.*?```", re.S)
@@ -63,6 +75,55 @@ def _protected_spans(text: str) -> list:
     spans = [ (m.start(), m.end()) for m in _MSG_REGION.finditer(text) ]
     spans += [ (m.start(), m.end()) for m in _FENCE_REGION.finditer(text) ]
     return spans
+
+
+def strip_tool_debris(text: str, known_tools=None) -> str:
+    """剥除工具调用碎片（invoke/parameter/calls 族的闭合符与 DSML 标记，裸或转义形态）。
+
+    这些碎片永远不可能是正文内容（它们是工具调用语法的 token）；模型退化时会
+    刷出几百条（flood）。msg/代码围栏内的内容绝不碰（那是给用户看的）。
+    只剥不执行 —— 本函数不做任何调用识别。
+
+    传 known_tools（注册工具名集合）时，连"工具形状的块"（<已注册工具名>…</>，
+    含转义形态）也一并剥掉 —— 搭救关时它们不会执行，留在文本里只会污染历史。
+    """
+    has_markup = ("invoke" in text or "parameter" in text
+                  or "DSML" in text or "tool_calls" in text)
+    if not has_markup and not known_tools:
+        return text
+    if not text:
+        return text
+    spans = _protected_spans(text)
+    cuts = []
+    for dm in _TOOL_DEBRIS.finditer(text):
+        if not _in_protected(spans, dm.start(), dm.end()):
+            cuts.append((dm.start(), dm.end()))
+    for dm in _DSML_ANY.finditer(text):
+        if not _in_protected(spans, dm.start(), dm.end()):
+            cuts.append((dm.start(), dm.end()))
+    if known_tools:
+        for m in _XML_TOOL.finditer(text):
+            name = m.group("name")
+            if name not in known_tools:
+                continue
+            if _in_protected(spans, m.start(), m.end()):
+                continue
+            cuts.append((m.start(), m.end()))
+        for m in _XML_TOOL_ESC.finditer(text):
+            name = m.group(1)
+            if name not in known_tools:
+                continue
+            if _in_protected(spans, m.start(), m.end()):
+                continue
+            cuts.append((m.start(), m.end()))
+    if not cuts:
+        return text
+    out = text
+    for s, e in sorted(set(cuts), reverse=True):
+        if _overlaps_protected(spans, s, e):
+            continue
+        out = out[:s] + out[e:]
+    return out
 
 
 def _in_protected(spans, s, e) -> bool:
@@ -160,7 +221,10 @@ class ToolRescue:
         async def chat_rescued(request, *args, **kwargs):
             resp = await original(request, *args, **kwargs)
             try:
-                mgr.translate(resp)
+                # 请求级闸门：这次调用压根没给模型工具（直调场景：摘要/决策等）
+                # ⇒ 文本里的工具形状块不是调用尝试 ⇒ 不动（防直调内容被误剥丢文）
+                if getattr(request, "tools", None) or getattr(request, "tool_set", None):
+                    mgr.translate(resp)
             except Exception:
                 # 搭救失败绝不影响原响应
                 logger.exception("[xml_tag_fixer] 工具搭救翻译异常（已忽略，原样放行）")
@@ -213,8 +277,11 @@ class ToolRescue:
         calls: list[dict] = []
         cuts: list = []  # (start, end) 待剥除区间
 
-        # 形态 A/B：DSML（完整块 / 退化块）
-        if self.plugin.rescue_dsml and _DSML_ANY.search(text):
+        # 形态 A/B：DSML（完整块 / 退化块 / 裸 invoke 无 DSML 前缀）
+        _has_tool_markup = bool(
+            _DSML_ANY.search(text) or _TOOL_DEBRIS.search(text)
+            or re.search(r"<invoke\s+name=", text))
+        if self.plugin.rescue_dsml and _has_tool_markup:
             for m in _DSML_INVOKE.finditer(text):
                 if _in_protected(spans, m.start(), m.end()):
                     continue
@@ -224,6 +291,14 @@ class ToolRescue:
                 if self._eligible(name, args, text, m.start()):
                     calls.append({"name": name, "args": args})
                     cuts.append((m.start(), m.end()))
+                else:
+                    # 失败的调用尝试（已注册工具但参数不合法）= 碎片：整块剥除
+                    #（框架本就静默丢弃，留在文本里只会污染历史）
+                    tail = text[m.end():]
+                    if _TOOL_DEBRIS.search(tail) or _DSML_PARAM.search(tail) or _DSML_ANY.search(tail):
+                        cuts.append((m.start(), m.end()))
+                    else:
+                        cuts.append((m.start(), m.end() - len(inner)))  # 孤立头只剥头
             # 退化形态：无 invoke 前缀的 <工具名"> 头 + 裸 parameter
             if not calls:
                 for hm in _DEGEN_HEAD.finditer(text):
@@ -246,10 +321,14 @@ class ToolRescue:
                         calls.append({"name": name, "args": args})
                         cuts.append((hm.start(), end))
 
-            # DSML 残片（闭合符等）一律剥除——无论是否搭救成功
+            # DSML 残片 + 裸闭合残片一律剥除——无论是否搭救成功
             for dm in _DSML_ANY.finditer(text):
                 if not _in_protected(spans, dm.start(), dm.end()):
                     cuts.append((dm.start(), dm.end()))
+            for dm in _TOOL_DEBRIS.finditer(text):
+                if not _in_protected(spans, dm.start(), dm.end()):
+                    cuts.append((dm.start(), dm.end()))
+
 
         # 形态 C：纯 XML 化调用（ops_config 那种）
         if self.plugin.rescue_xml_tooltag:
@@ -264,7 +343,9 @@ class ToolRescue:
                     continue
                 if self._eligible(name, args, text, m.start()):
                     calls.append({"name": name, "args": args})
-                    cuts.append((m.start(), m.end()))
+                # 已注册工具的形状块：救不救都剥掉（救=已执行；没救=失败的调用尝试，
+                # 群里本来看不到，留在文本里只污染历史）
+                cuts.append((m.start(), m.end()))
 
         # 幂等去重（同轮同 工具+参数 只留一个）
         deduped = []
@@ -303,8 +384,20 @@ class ToolRescue:
             return False
 
     def _tag_known(self, name: str) -> bool:
-        return (name in self.plugin._registered_msg_tags
-                or name in self.plugin._registered_root_tags)
+        """注册输出标签（msg 级 + 根级）豁免判定。
+
+        主判据：on_llm_request 缓存的本请求 tag_set 名单；
+        兜底：全局 `core.tag.tag_registry` 实时查（缓存还没建立时也安全）。
+        """
+        if (name in self.plugin._registered_msg_tags
+                or name in self.plugin._registered_root_tags):
+            return True
+        try:
+            from core.tag import tag_registry
+            return (tag_registry.get(name=name) is not None
+                    or tag_registry.get_root(name=name) is not None)
+        except Exception:
+            return False
 
     def _eligible(self, name: str, args: Optional[dict], text: str, pos: int) -> bool:
         if args is None:
