@@ -25,6 +25,18 @@ _MSG_ANY_SEARCH_RE = re.compile(r"<msg(?:\s[^>]*?)?(/?)>|</msg\s*>")
 _DBL_ANGLE_RE = re.compile(r"<<(\w+)")
 _BACKSLASH_TAG_RE = re.compile(r"<\\(/?)([a-zA-Z][\w-]*)>")
 
+# 最终可见文本里的孤儿残片：任意完整闭合标签，或工具协议特有的截断尾部。
+# 只在整行/整条完全由这些 token 组成时清理，绝不做行内替换。
+_VISIBLE_DEBRIS_TOKEN_RE = re.compile(
+    r"(?:</([a-zA-Z_][\w.:-]*)[ \t]*>"
+    r"|((?:tool_calls|function_calls|calls|functions|invoke|parameter)[ \t]*>))",
+    re.IGNORECASE,
+)
+_VISIBLE_TOOL_DEBRIS_NAMES = frozenset({
+    "tool_calls", "function_calls", "calls", "functions", "invoke", "parameter",
+})
+_VISIBLE_TOOL_FRAGMENT_MARKERS = ("calls", "invoke", "parameter", "functions")
+
 # ========== 一次性配置迁移 ==========
 #
 # 1.5.0 把「处理 msg 外杂散内容」(strip_reasoning_block) 的默认值由 true 改为
@@ -1275,6 +1287,151 @@ class XmlTagFixerPlugin(BasePlugin):
             parts[i] = self._strip_structural_tags(parts[i])
         return "```".join(parts)
 
+    def _is_orphan_debris_line(self, line: str) -> bool:
+        """整行是否只由孤儿闭合标签/工具截断 token 组成。
+
+        任意 `</xxx>` 都可判定为孤儿残片；`calls>` 这类没有 `<` 的形态
+        只接受明确的工具协议词。多个 token 可位于同一行，但不允许夹杂任何
+        普通文字、标点或比较表达式，从判据上避免行内误删。
+        """
+        body = line.rstrip("\r\n").strip(" \t")
+        if not body:
+            return False
+        pos = 0
+        found = False
+        while pos < len(body):
+            m = _VISIBLE_DEBRIS_TOKEN_RE.match(body, pos)
+            if not m:
+                return False
+            close_name, fragment_name = m.groups()
+            name = (close_name or fragment_name).lower()
+            if fragment_name is not None and not self.strip_tool_debris:
+                return False
+            if close_name is not None and not self.strip_tool_debris \
+                    and name in _VISIBLE_TOOL_DEBRIS_NAMES:
+                return False
+            found = True
+            pos = m.end()
+            if pos < len(body):
+                if body[pos] not in " \t":
+                    return False
+                while pos < len(body) and body[pos] in " \t":
+                    pos += 1
+        return found
+
+    @staticmethod
+    def _orphan_debris_code_spans(text: str) -> list:
+        """返回代码围栏与行内代码的保护区；未闭合围栏保护到文本末尾。"""
+        spans = []
+        i = 0
+        n = len(text)
+        while i < n:
+            if text.startswith("```", i):
+                end = text.find("```", i + 3)
+                stop = n if end == -1 else end + 3
+                spans.append((i, stop))
+                i = stop
+                continue
+            if text[i] == "`":
+                j = i + 1
+                while j < n and text[j] == "`":
+                    j += 1
+                ticks = text[i:j]
+                end = text.find(ticks, j)
+                if end != -1:
+                    stop = end + len(ticks)
+                    spans.append((i, stop))
+                    i = stop
+                else:
+                    i = j
+                continue
+            i += 1
+        return spans
+
+    def _clean_orphan_debris_text(self, text: str) -> str:
+        """仅删除代码区外、独立成行的残片，其他字符与原换行保持不变。"""
+        if not text or ">" not in text:
+            return text
+        spans = self._orphan_debris_code_spans(text)
+        parts = []
+        changed = False
+        pos = 0
+        for line in text.splitlines(keepends=True):
+            end = pos + len(line)
+            in_code = any(pos < b and end > a for a, b in spans)
+            if not in_code and self._is_orphan_debris_line(line):
+                changed = True
+            else:
+                parts.append(line)
+            pos = end
+        return "".join(parts) if changed else text
+
+    @staticmethod
+    def _remove_text_preserve_tail(root: ET.Element, child: ET.Element) -> None:
+        """删除空 text 节点时保留格式化 tail，避免改变后续节点位置。"""
+        children = list(root)
+        idx = children.index(child)
+        tail = child.tail or ""
+        if tail:
+            if idx:
+                prev = children[idx - 1]
+                prev.tail = (prev.tail or "") + tail
+            else:
+                root.text = (root.text or "") + tail
+        root.remove(child)
+
+    def _clean_orphan_debris_blocks(self, blocks: list) -> list:
+        """在最终可见 `<text>` 层清理孤儿残片；未命中块逐字节原样返回。
+
+        真正的功能标签仍是 XML 元素，不在清理面上。只有已经退化为正文、
+        且独立成行的残片才会命中。显式保真模式优先，不做这层内容清理。
+        """
+        if not self.fallback_strip_tags:
+            return blocks
+        result = []
+        for block in blocks:
+            if not any(x in block for x in ("&lt;", "&gt;", "&#")):
+                # 只有可能出现工具词时才进入 ET 检查；普通长消息不做全文 regex 扫描。
+                folded = block.lower()
+                if not any(x in folded for x in _VISIBLE_TOOL_FRAGMENT_MARKERS):
+                    result.append(block)
+                    continue
+            try:
+                root = ET.fromstring(block)
+            except ET.ParseError:
+                result.append(block)
+                continue
+            if root.tag != "msg":
+                result.append(block)
+                continue
+
+            original_children = list(root)
+            text_only = bool(original_children) and all(c.tag == "text" for c in original_children)
+            changed = False
+            for child in original_children:
+                if child.tag != "text":
+                    continue
+                before = child.text or ""
+                after = self._clean_orphan_debris_text(before)
+                if after != before:
+                    child.text = after
+                    changed = True
+            if not changed:
+                result.append(block)
+                continue
+
+            # 纯残片消息整块省略；含其他功能元素的消息只删空 text，功能不受影响。
+            if text_only and not any(
+                    (c.text or "").strip() or (c.tail or "").strip() for c in root):
+                logger.debug("已省略仅含孤儿标签残片的消息块")
+                continue
+            for child in list(root):
+                if child.tag == "text" and not (child.text or "").strip():
+                    self._remove_text_preserve_tail(root, child)
+            result.append(ET.tostring(root, encoding="unicode", method="xml"))
+            logger.debug("已清理最终可见文本中的独立孤儿标签残片")
+        return result
+
     def _fallback_wrap(self, original_block: str, allow_original: bool = False) -> list:
         """所有修复手段都失败时，清洗为纯文本消息。
 
@@ -1511,14 +1668,19 @@ class XmlTagFixerPlugin(BasePlugin):
             else:
                 logger.debug(f"闸门拦截不可解析块，尝试抢救: {b[:80]}")
                 gated.extend(self._salvage_block(b))
-        fixed_blocks = gated
+        # 最终可见文本闸门：覆盖合法实体文本、末尾散段救回与 fallback 三条来路。
+        # 放在结构修复之后，真正的功能闭合标签已被 XML 元素消费，不会被误当残片。
+        fixed_blocks = self._clean_orphan_debris_blocks(gated)
 
         result = "\n".join(fixed_blocks)
 
         # ---- 总闸门：整轮级别的不变量 ----
         if not self._is_parseable(result):
             logger.warning("最终结果仍不可解析，启用总闸门兜底")
-            return self._last_resort(result)
+            result = self._last_resort(result)
+            if result:
+                # 总闸门自身也必须遵守同一可见残片约定，不能从后门重新带出残片。
+                result = "\n".join(self._clean_orphan_debris_blocks([result]))
         return result
 
     @on.llm_response(priority=Priority.HIGH)
