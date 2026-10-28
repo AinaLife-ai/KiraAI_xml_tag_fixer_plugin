@@ -15,6 +15,9 @@ PLUGIN_ID = "xml_tag_fixer"
 
 # MiMo TTS 插件的 plugin_id（用于接管其格式修复功能）
 MIMO_PLUGIN_ID = "kira-ai-plugin-mimo-tts"
+# 可选流式协同：acc 抢发 / QQ 官方 bot 的 token 预览（特征探测，缺失时零影响）
+ACC_PLUGIN_ID = "kira_accelerator"
+QQBOT_PLUGIN_ID = "qqbot-fullmsg-bridge"
 
 # 切块器用的 <msg> 扫描正则（模块级，避免每次调用重复编译）
 # 属性部分懒惰匹配，且不吞掉自闭合的 /（对齐原实现的开口识别口径）
@@ -256,6 +259,11 @@ class XmlTagFixerPlugin(BasePlugin):
         self._rescue_notes = []      # 待注入的当轮提示（下轮 on_llm_request 消费）
 
         self._mimo_checked = False
+        # 流式协同只保存“自己挂上去的那一层”，卸载时绝不误拆其他插件包装。
+        self._acc_instance = None
+        self._acc_original_make_engine = None
+        self._qq_preview_instance = None
+        self._qq_preview_original = None
 
     # ========== 标签定界符修复（双尖括号 / 反斜杠转义）==========
 
@@ -365,6 +373,7 @@ class XmlTagFixerPlugin(BasePlugin):
                     f"tool_rescue={self.tool_tag_rescue and self._rescue is not None})")
         self._run_config_migration()
         self._try_takeover_mimo()
+        self._try_attach_stream_peers()
 
     def _run_config_migration(self) -> None:
         """执行一次性配置迁移（幂等），并让当前会话立即采用迁移后的值。
@@ -406,6 +415,7 @@ class XmlTagFixerPlugin(BasePlugin):
             return None
 
     async def terminate(self):
+        self._detach_stream_peers()
         if self._rescue is not None:
             try:
                 self._rescue.uninstall()
@@ -416,8 +426,9 @@ class XmlTagFixerPlugin(BasePlugin):
 
     @on.loaded()
     async def _on_loaded(self, *_):
-        # 所有插件加载完成后再检测一次（覆盖 mimo 比本插件后加载的情况）
+        # 所有插件加载完成后再检测一次（覆盖协同插件比本插件后加载的情况）
         self._try_takeover_mimo()
+        self._try_attach_stream_peers()
 
     def _try_takeover_mimo(self):
         """接管 MiMo TTS 插件的格式修复：将其 auto_format_fix 运行时置 False。
@@ -441,6 +452,186 @@ class XmlTagFixerPlugin(BasePlugin):
                 inst.auto_format_fix = False
                 logger.info("已接管 MiMo TTS 的格式修复（标签摊平 + 语音拆分由本插件处理），"
                             "mimo 插件的 auto_format_fix 已运行时关闭")
+
+    # ========== 可选流式协同（acc 抢发 / QQ 官方 token 预览）==========
+
+    def _try_attach_stream_peers(self):
+        """在请求开始前挂接流式协同；插件不存在/接口变化时自然跳过。"""
+        if not self.enabled:
+            return
+        for attach in (self._try_attach_acc, self._try_attach_qq_preview):
+            try:
+                attach()
+            except Exception:
+                logger.debug(f"[xml_tag_fixer] 流式协同挂接跳过: {attach.__name__}",
+                             exc_info=True)
+
+    def _try_attach_acc(self):
+        """包装 acc 的引擎工厂：抢发前清残片，完成时接工具搭救。
+
+        只操作当前 acc 实例；原 emit/on_complete 全部保留。正常段内容不变，
+        纯残片按“已处理但无需投递”返回 True，让 acc 的防重复台账保持一致。
+        """
+        try:
+            inst = self.ctx.get_plugin_inst(ACC_PLUGIN_ID)
+        except Exception:
+            return
+        if inst is None:
+            return
+        current = getattr(inst, "_make_engine", None)
+        if not callable(current):
+            return
+        if getattr(current, "_xtf_acc_owner", None) is self:
+            self._acc_instance = inst
+            self._acc_original_make_engine = current._xtf_acc_original
+            return
+        if self._acc_instance is inst:
+            return  # 后续另有包装：不重复叠加，也不误拆别人的层
+        original = getattr(current, "_xtf_acc_original", current)
+
+        def make_engine(request=None):
+            engine = original(request)
+            try:
+                self._instrument_acc_engine(engine, request)
+            except Exception:
+                logger.exception("[xml_tag_fixer] acc 引擎协同异常（按原引擎放行）")
+            return engine
+
+        make_engine._xtf_acc_owner = self
+        make_engine._xtf_acc_original = original
+        inst._make_engine = make_engine
+        self._acc_instance = inst
+        self._acc_original_make_engine = original
+        logger.info("[xml_tag_fixer] 已接入 acc 抢发残片清理与工具搭救协同")
+
+    def _instrument_acc_engine(self, engine, request):
+        if getattr(engine, "_xtf_acc_instrumented", False):
+            return
+        original_emit = getattr(engine, "emit", None)
+        if callable(original_emit):
+            async def emit_clean(seg):
+                if not self.enabled:
+                    return await original_emit(seg)
+                try:
+                    cleaned = "\n".join(self._clean_orphan_debris_blocks([seg]))
+                except Exception:
+                    logger.exception("[xml_tag_fixer] acc 抢发清理异常（按原段放行）")
+                    return await original_emit(seg)
+                if not cleaned:
+                    # 纯残片不投递，但必须让 acc 视为已消费，避免后续引擎停发/框架重发。
+                    logger.debug("[xml_tag_fixer] acc 抢发段仅含残片，已静默消费")
+                    return True
+                return await original_emit(cleaned)
+            engine.emit = emit_clean
+
+        previous = getattr(engine, "on_complete", None)
+        rescue = self._rescue
+
+        def complete(resp):
+            try:
+                # 与普通 chat 包装同一请求级闸门：摘要/决策等无工具直调不翻译。
+                if self.enabled and rescue is not None and (
+                        getattr(request, "tools", None) or getattr(request, "tool_set", None)):
+                    rescue.translate(resp)
+            except Exception:
+                logger.exception("[xml_tag_fixer] acc 工具搭救异常（保留原响应）")
+            try:
+                # acc 台账原本记录未清理段；若本轮会经过最终修复，必须同步成同一形态，
+                # 否则“抢发的是清理文、台账是原始文”会导致混合正文段剥离失败并重复。
+                # only_final 跳过带工具步时保留原台账，因为最终 text_response 不会被改写。
+                if self.enabled and not (self.only_final and getattr(resp, "tool_calls", None)):
+                    segs = getattr(resp, "_accel_early_sent_segments", None)
+                    if isinstance(segs, list):
+                        resp.__dict__["_accel_early_sent_segments"] = [
+                            "\n".join(self._clean_orphan_debris_blocks([seg])) for seg in segs
+                        ]
+            except Exception:
+                logger.exception("[xml_tag_fixer] acc 抢发台账规范化异常（保留原台账）")
+            if previous is not None:
+                previous(resp)
+        engine.on_complete = complete
+        engine._xtf_acc_instrumented = True
+
+    def _try_attach_qq_preview(self):
+        """清理 QQ 官方 bot 的 token 预览文字，不碰原始 XML 与权威发送。"""
+        try:
+            inst = self.ctx.get_plugin_inst(QQBOT_PLUGIN_ID)
+        except Exception:
+            return
+        manager = getattr(inst, "c2c_stream", None) if inst is not None else None
+        current = getattr(manager, "observe_raw", None)
+        if not callable(current):
+            return
+        if getattr(current, "_xtf_qq_owner", None) is self:
+            self._qq_preview_instance = manager
+            self._qq_preview_original = current._xtf_qq_original
+            return
+        if self._qq_preview_instance is manager:
+            return
+        original = getattr(current, "_xtf_qq_original", current)
+        func = getattr(original, "__func__", original)
+        display = getattr(func, "__globals__", {}).get("display_text_of")
+        if not callable(display):
+            return
+
+        def observe_raw(adapter, client, target, msg_id, raw):
+            if not self.enabled:
+                return original(adapter, client, target, msg_id, raw)
+            # 原始 `</use>` 本就会被 display_text_of 截掉；只检查实体和工具截断候选。
+            if raw and not any(x in raw for x in ("&lt;", "&gt;", "&#")):
+                folded = raw.lower()
+                if not any(x in folded for x in _VISIBLE_TOOL_FRAGMENT_MARKERS):
+                    return original(adapter, client, target, msg_id, raw)
+            try:
+                shown = display(raw)
+                if not self.fallback_strip_tags:
+                    return original(adapter, client, target, msg_id, raw)
+                decoded = xml_unescape(shown, {"&quot;": '"', "&apos;": "'"})
+                cleaned = self._clean_orphan_debris_text(decoded)
+                if cleaned == decoded:
+                    cleaned = shown       # 普通实体正文保持原预览，不做额外规范化
+            except Exception:
+                return original(adapter, client, target, msg_id, raw)
+            if cleaned == shown:
+                return original(adapter, client, target, msg_id, raw)
+            if not cleaned:
+                return None               # 纯残片预览不创建流，也不留下垃圾帧
+            result = original(adapter, client, target, msg_id, raw)
+            try:
+                # observe_raw 是同步函数；在后台 flusher 运行前替换为权威清理文本。
+                sess = manager._sessions.get(target)
+                if sess is not None and sess.value == shown:
+                    sess.value = cleaned
+            except Exception:
+                logger.debug("[xml_tag_fixer] QQ 预览清理后同步失败（保留原流程）",
+                             exc_info=True)
+            return result
+
+        observe_raw._xtf_qq_owner = self
+        observe_raw._xtf_qq_original = original
+        manager.observe_raw = observe_raw
+        self._qq_preview_instance = manager
+        self._qq_preview_original = original
+        logger.info("[xml_tag_fixer] 已接入 QQ 官方 bot 流式预览残片清理")
+
+    def _detach_stream_peers(self):
+        """只还原本实例装上的包装；其他插件后装的层不动。"""
+        inst, original = self._acc_instance, self._acc_original_make_engine
+        if inst is not None and original is not None:
+            try:
+                if getattr(inst._make_engine, "_xtf_acc_owner", None) is self:
+                    inst._make_engine = original
+            except Exception:
+                logger.debug("[xml_tag_fixer] acc 协同卸载跳过", exc_info=True)
+        manager, original = self._qq_preview_instance, self._qq_preview_original
+        if manager is not None and original is not None:
+            try:
+                if getattr(manager.observe_raw, "_xtf_qq_owner", None) is self:
+                    manager.observe_raw = original
+            except Exception:
+                logger.debug("[xml_tag_fixer] QQ 预览协同卸载跳过", exc_info=True)
+        self._acc_instance = self._acc_original_make_engine = None
+        self._qq_preview_instance = self._qq_preview_original = None
 
     # ========== 代码围栏感知转义 ==========
 
@@ -495,6 +686,8 @@ class XmlTagFixerPlugin(BasePlugin):
         已注册标签（内置 text/record/file 及插件注册的 mimo_tts 等）内容绝不转义；
         未注册标签（reasoning/think/foo 等）内部整体转义后原样保留。
         """
+        # 协同插件可能刚重载：请求前重挂到新实例，当前这轮流式输出即受保护。
+        self._try_attach_stream_peers()
         try:
             self._registered_msg_tags = {t.name for t in tag_set.get_all()}
             self._registered_root_tags = {t.name for t in tag_set.get_all_root()}
@@ -1687,6 +1880,7 @@ class XmlTagFixerPlugin(BasePlugin):
     async def on_llm_response(self, event: KiraMessageBatchEvent, resp: LLMResponse):
         if not self.enabled:
             return
+        self._try_attach_stream_peers()
         if self.only_final and resp.tool_calls:
             return
         if not resp.text_response:
